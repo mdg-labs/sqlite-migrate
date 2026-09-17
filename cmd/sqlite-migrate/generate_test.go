@@ -6,12 +6,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mdg-labs/sqlite-migrate/internal/rename"
 	"github.com/mdg-labs/sqlite-migrate/internal/schemadiff"
 
 	_ "modernc.org/sqlite"
@@ -53,7 +55,7 @@ func assertJournalMatchesSchema(t *testing.T, migrationsDir, schemaPath string) 
 	t.Helper()
 	ctx := context.Background()
 
-	journal, err := readJournal(migrationsDir)
+	journal, err := readJournal(ctx, migrationsDir)
 	if err != nil {
 		t.Fatalf("readJournal: %v", err)
 	}
@@ -434,5 +436,138 @@ func TestGenerate_TestdataScenarios(t *testing.T) {
 	}
 	if found == 0 {
 		t.Fatal("no scenario directories found under testdata/schemas")
+	}
+}
+
+// TestGenerate_CompoundTableAndColumnRename covers a table rename and a
+// rename of one of that table's own columns made in the same schema.sql
+// edit: at raw-diff time the column lives inside the whole dropped/added
+// table pair, never in a ChangedTables entry rename.Detect could see, so
+// without re-resolving after the table rename is applied this used to be
+// misclassified destructive and silently drop the renamed column's data
+// under --allow-destructive.
+func TestGenerate_CompoundTableAndColumnRename(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    qty INTEGER
+) STRICT;`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	writeSchema(t, schemaPath, `CREATE TABLE purchases (
+    id INTEGER PRIMARY KEY,
+    amount INTEGER
+) STRICT;`)
+
+	// Confirm the table rename (orders -> purchases), then the column
+	// rename it reveals (qty -> amount).
+	res, err := generate(context.Background(), opts, strings.NewReader("y\ny\n"), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	body := readFileString(t, res.path)
+	if !strings.Contains(body, "RENAME TO") || !strings.Contains(body, "RENAME COLUMN") {
+		t.Fatalf("expected both a table and column rename statement, got:\n%s", body)
+	}
+	if strings.Contains(body, "_sqlite_migrate_new") {
+		t.Fatalf("expected a plain rename, not a rebuild that would drop data, got:\n%s", body)
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
+// TestGenerate_NewTableWithForeignKeyColumnAddedTogether covers adding a
+// brand-new table and, in the same schema.sql edit, a new column on an
+// existing table that references it: addColumnStatements used to scope
+// the new table into its sqldef call regardless, so sqldef emitted its
+// CREATE TABLE a second time on top of buildMigrationBody's own
+// AddedTables statement, and generate failed with "table ... already
+// exists" for an entirely valid schema change.
+func TestGenerate_NewTableWithForeignKeyColumnAddedTogether(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE orders (
+    id INTEGER PRIMARY KEY
+) STRICT;`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	writeSchema(t, schemaPath, `CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    region_id INTEGER REFERENCES regions(id)
+) STRICT;
+
+CREATE TABLE regions (
+    id INTEGER PRIMARY KEY
+) STRICT;`)
+
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
+// TestGenerate_AddedColumnWithCheckConstraintChange covers adding a new
+// column to a table while also tightening an existing CHECK constraint on
+// that same table in the same schema.sql edit: needsRebuild used to
+// assume any added column fully explained the table's CREATE TABLE text
+// change, routing this straight to sqldefwrap (ADD COLUMN only) and
+// silently dropping the CHECK edit, which then failed the drift check.
+func TestGenerate_AddedColumnWithCheckConstraintChange(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    age INTEGER
+) STRICT;`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	writeSchema(t, schemaPath, `CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    age INTEGER CHECK (age >= 0),
+    name TEXT
+) STRICT;`)
+
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
+// TestGenerate_ConflictingAssumeRenameFlags covers passing both
+// --assume-renames and --assume-no-renames when the diff has no rename
+// candidates at all (e.g. a plain added column): the conflict used to be
+// enforced only inside rename.Confirm's per-candidate loop, so it was
+// silently accepted whenever that loop never ran.
+func TestGenerate_ConflictingAssumeRenameFlags(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+	opts.assumeRenames = true
+	opts.assumeNoRenames = true
+
+	writeSchema(t, schemaPath, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`)
+
+	_, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	if !errors.Is(err, rename.ErrConflictingAssumeFlags) {
+		t.Fatalf("expected ErrConflictingAssumeFlags, got: %v", err)
 	}
 }

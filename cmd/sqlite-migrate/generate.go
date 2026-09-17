@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"github.com/mdg-labs/sqlite-migrate/internal/rename"
 	"github.com/mdg-labs/sqlite-migrate/internal/schemadiff"
 	"github.com/mdg-labs/sqlite-migrate/internal/sqldefwrap"
+	"github.com/mdg-labs/sqlite-migrate/internal/sqlident"
 )
 
 // timestampLayout is the sortable version identifier every migration file
@@ -85,6 +87,10 @@ type generateResult struct {
 // file and returns whether a migration file was written and, if so, its
 // path. An error means generate refused to write anything.
 func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout io.Writer) (generateResult, error) {
+	if opts.assumeRenames && opts.assumeNoRenames {
+		return generateResult{}, rename.ErrConflictingAssumeFlags
+	}
+
 	schemaBytes, err := os.ReadFile(opts.schemaPath)
 	if err != nil {
 		return generateResult{}, fmt.Errorf("read %s: %w", opts.schemaPath, err)
@@ -93,10 +99,10 @@ func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout
 
 	desiredSchema, err := schemadiff.Parse(ctx, desiredDDL)
 	if err != nil {
-		return generateResult{}, err
+		return generateResult{}, fmt.Errorf("parse %s: %w", opts.schemaPath, err)
 	}
 
-	journalDDL, err := readJournal(opts.migrationsDir)
+	journalDDL, err := readJournal(ctx, opts.migrationsDir)
 	if err != nil {
 		return generateResult{}, err
 	}
@@ -111,12 +117,26 @@ func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout
 		return generateResult{}, nil
 	}
 
-	resolutions, err := rename.Resolve(ctx, rawDiff, stdin, stdout, rename.Flags{
+	renameFlags := rename.Flags{
 		AssumeRenames:   opts.assumeRenames,
 		AssumeNoRenames: opts.assumeNoRenames,
-	})
+	}
+	// Shared across every Confirm prompt in this run, including the second
+	// rename.Detect pass below: wrapping stdin in a fresh bufio.Reader per
+	// call would discard whatever bytes an earlier call already buffered
+	// but not consumed (see rename.ResolveCandidates).
+	renameIn := bufio.NewReader(stdin)
+
+	resolutions, err := rename.ResolveCandidates(ctx, rename.Detect(rawDiff), renameIn, stdout, renameFlags)
 	if err != nil {
 		return generateResult{}, err
+	}
+
+	renamedTables := make(map[string]bool)
+	for _, r := range resolutions {
+		if r.Confirmed && r.Candidate.Kind == rename.TableRename {
+			renamedTables[r.Candidate.To] = true
+		}
 	}
 
 	renameSection := buildRenameStatements(resolutions)
@@ -135,6 +155,38 @@ func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout
 		return generateResult{}, nil
 	}
 
+	// A table rename can reveal a column rename inside the same table that
+	// rawDiff had no way to see: at that point the column lived inside the
+	// whole dropped/added table pair, never in a ChangedTables entry
+	// detectColumnRenames could run against. Re-resolve just the renamed
+	// tables' now-visible column diffs so a compound table+column rename
+	// made in one schema.sql edit isn't misclassified as a destructive
+	// drop+add.
+	if len(renamedTables) > 0 {
+		var revealed []schemadiff.TableDiff
+		for _, td := range diff.ChangedTables {
+			if renamedTables[td.Name] {
+				revealed = append(revealed, td)
+			}
+		}
+		if len(revealed) > 0 {
+			colCandidates := rename.Detect(&schemadiff.SchemaDiff{ChangedTables: revealed})
+			colResolutions, err := rename.ResolveCandidates(ctx, colCandidates, renameIn, stdout, renameFlags)
+			if err != nil {
+				return generateResult{}, err
+			}
+			if colRenameSection := buildRenameStatements(colResolutions); colRenameSection != "" {
+				renameSection = strings.TrimSpace(renameSection + "\n\n" + colRenameSection)
+				currentDDLResolved += "\n" + colRenameSection
+				currentSchemaResolved, err = schemadiff.Parse(ctx, currentDDLResolved)
+				if err != nil {
+					return generateResult{}, fmt.Errorf("replay resolved renames: %w", err)
+				}
+				diff = schemadiff.Diff(currentSchemaResolved, desiredSchema)
+			}
+		}
+	}
+
 	classification := schemadiff.Classify(diff)
 	if classification.Verdict == schemadiff.Destructive && !opts.allowDestructive {
 		return generateResult{}, destructiveError(classification)
@@ -149,7 +201,7 @@ func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout
 		return generateResult{}, err
 	}
 
-	path, err := writeMigrationFile(opts, body, diff)
+	path, err := writeMigrationFile(ctx, opts, body, diff)
 	if err != nil {
 		return generateResult{}, err
 	}
@@ -160,7 +212,11 @@ func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout
 // readJournal reconstructs the current schema's DDL by concatenating every
 // existing migration file's SQL body in filename order. A missing
 // migrations directory is a cold repo, not an error: the journal is empty.
-func readJournal(dir string) (string, error) {
+func readJournal(ctx context.Context, dir string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -180,6 +236,9 @@ func readJournal(dir string) (string, error) {
 
 	var parts []string
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		b, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			return "", fmt.Errorf("read migration %s: %w", name, err)
@@ -235,7 +294,11 @@ func buildMigrationBody(ctx context.Context, renameSection string, diff *schemad
 	var rebuildDiffs []schemadiff.TableDiff
 
 	for _, td := range diff.ChangedTables {
-		if needsRebuild(td) {
+		full, err := needsRebuild(ctx, td)
+		if err != nil {
+			return "", err
+		}
+		if full {
 			rebuildDiffs = append(rebuildDiffs, td)
 			continue
 		}
@@ -299,32 +362,75 @@ func buildMigrationBody(ctx context.Context, renameSection string, diff *schemad
 // column's definition changed, any foreign key removed or added onto a
 // column that already existed, any index change that isn't a plain
 // explicit CREATE INDEX (an implied unique/primary-key index means an
-// inline constraint changed), or a CREATE TABLE text change with no new
-// column to explain it (a CHECK/COLLATE/GENERATED change PRAGMA
-// introspection can't see any other way — see schemadiff.TableDiff.SQLChanged).
-func needsRebuild(td schemadiff.TableDiff) bool {
+// inline constraint changed), or a CREATE TABLE text change that isn't
+// fully explained by the added columns themselves (a CHECK/COLLATE/
+// GENERATED change PRAGMA introspection can't see any other way — see
+// schemadiff.TableDiff.SQLChanged and additiveChangeReproducesAfter).
+func needsRebuild(ctx context.Context, td schemadiff.TableDiff) (bool, error) {
 	if len(td.RemovedColumns) > 0 || len(td.ChangedColumns) > 0 || len(td.RemovedForeignKeys) > 0 {
-		return true
+		return true, nil
 	}
 	for _, fk := range td.AddedForeignKeys {
 		if !isAddedColumn(td, fk.From) {
-			return true
+			return true, nil
 		}
 	}
 	for _, idx := range td.AddedIndexes {
 		if idx.Origin != "c" {
-			return true
+			return true, nil
 		}
 	}
 	for _, idx := range td.RemovedIndexes {
 		if idx.Origin != "c" {
-			return true
+			return true, nil
 		}
 	}
-	if td.SQLChanged && len(td.AddedColumns) == 0 {
-		return true
+	if !td.SQLChanged {
+		return false, nil
 	}
-	return false
+	if len(td.AddedColumns) == 0 {
+		return true, nil
+	}
+	ok, err := additiveChangeReproducesAfter(ctx, td)
+	if err != nil {
+		return false, err
+	}
+	return !ok, nil
+}
+
+// additiveChangeReproducesAfter reports whether generating and applying
+// sqldef's additive statements for td's own before/after CREATE TABLE text
+// alone reproduces the desired table exactly. This is the only reliable
+// way to tell a table whose CREATE TABLE text changed purely because of
+// its added columns apart from one that picked up an untracked
+// CHECK/COLLATE/GENERATED change in the same schema.sql edit: neither case
+// is distinguishable from schemadiff.TableDiff's structured fields alone
+// (see SQLChanged), so this replays the candidate additive-only change
+// into a scratch database and compares the result structurally, the same
+// technique verifyCandidate uses for the whole migration.
+func additiveChangeReproducesAfter(ctx context.Context, td schemadiff.TableDiff) (bool, error) {
+	ddls, err := sqldefwrap.New().Diff(td.After.SQL, td.Before.SQL)
+	if err != nil {
+		return false, fmt.Errorf("sqldefwrap: %w", err)
+	}
+	stmts := make([]string, len(ddls))
+	for i, ddl := range ddls {
+		stmts[i] = ddl + ";"
+	}
+
+	beforeSQL := strings.TrimRight(td.Before.SQL, "; \t\n") + ";"
+	replayed, err := schemadiff.Parse(ctx, beforeSQL+"\n"+strings.Join(stmts, "\n"))
+	if err != nil {
+		return false, nil
+	}
+	got, ok := replayed.Tables[td.Name]
+	if !ok {
+		return false, nil
+	}
+
+	gotSchema := &schemadiff.Schema{Tables: map[string]*schemadiff.Table{td.Name: got}}
+	wantSchema := &schemadiff.Schema{Tables: map[string]*schemadiff.Table{td.Name: td.After}}
+	return schemadiff.Diff(gotSchema, wantSchema).Empty(), nil
 }
 
 func isAddedColumn(td schemadiff.TableDiff, name string) bool {
@@ -339,13 +445,20 @@ func isAddedColumn(td schemadiff.TableDiff, name string) bool {
 // addColumnStatements generates the ADD COLUMN statements for a table
 // whose only changes are new columns, via internal/sqldefwrap — the one
 // package that already handles folding a REFERENCES clause into ADD
-// COLUMN correctly. It scopes the call to just this table and any table
-// its new columns reference, rather than the whole schema, so sqldef never
-// sees (and can't misjudge) any other table's unrelated changes.
+// COLUMN correctly. It scopes the call to just this table and any
+// already-existing table its new columns reference, rather than the whole
+// schema, so sqldef never sees (and can't misjudge) any other table's
+// unrelated changes. A foreign key's target table that doesn't exist yet
+// in current is itself a brand-new table, already handled in full by
+// buildMigrationBody's own AddedTables loop; scoping it in here too would
+// make sqldef see it as newly created and emit its CREATE TABLE a second
+// time.
 func addColumnStatements(td schemadiff.TableDiff, current, desired *schemadiff.Schema) ([]string, error) {
-	names := map[string]bool{strings.ToLower(td.Name): true}
+	names := map[string]bool{asciiLower(td.Name): true}
 	for _, fk := range td.AddedForeignKeys {
-		names[strings.ToLower(fk.Table)] = true
+		if findTable(current, fk.Table) != nil {
+			names[asciiLower(fk.Table)] = true
+		}
 	}
 
 	sortedNames := make([]string, 0, len(names))
@@ -376,12 +489,34 @@ func addColumnStatements(td schemadiff.TableDiff, current, desired *schemadiff.S
 }
 
 func findTable(s *schemadiff.Schema, name string) *schemadiff.Table {
+	target := asciiLower(name)
 	for _, t := range s.Tables {
-		if strings.EqualFold(t.Name, name) {
+		if asciiLower(t.Name) == target {
 			return t
 		}
 	}
 	return nil
+}
+
+// asciiLower folds ASCII letters to lower case, matching SQLite's own
+// case-insensitive identifier comparison (which never applies Unicode
+// case-folding rules) and internal/schemadiff's identity key — unlike
+// strings.ToLower/EqualFold, which fold Unicode case too and so can treat
+// two identifiers as equal (or distinct) differently than SQLite itself
+// would.
+func asciiLower(s string) string {
+	b := []byte(s)
+	changed := false
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+			changed = true
+		}
+	}
+	if !changed {
+		return s
+	}
+	return string(b)
 }
 
 // verifyCandidate is the replay-based drift check Core Design Principle 6
@@ -442,8 +577,9 @@ func deriveSlug(message string, diff *schemadiff.SchemaDiff) string {
 	}
 }
 
+// quoteIdent double-quote-wraps a SQL identifier; see internal/sqlident.QuoteIdent.
 func quoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	return sqlident.QuoteIdent(name)
 }
 
 // writeMigrationFile picks a unique timestamp, computes the migration's
@@ -451,12 +587,15 @@ func quoteIdent(name string) string {
 // directory. The checksum is recorded as a leading SQL comment (harmless
 // to replay) rather than a sidecar file, so a later `check`/`apply` can
 // verify it without any extra bookkeeping file to keep in sync.
-func writeMigrationFile(opts generateOptions, body string, diff *schemadiff.SchemaDiff) (string, error) {
+func writeMigrationFile(ctx context.Context, opts generateOptions, body string, diff *schemadiff.SchemaDiff) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(opts.migrationsDir, 0o755); err != nil {
 		return "", fmt.Errorf("create migrations dir %s: %w", opts.migrationsDir, err)
 	}
 
-	ts, err := nextTimestamp(opts.migrationsDir, opts.now())
+	ts, err := nextTimestamp(ctx, opts.migrationsDir, opts.now())
 	if err != nil {
 		return "", err
 	}
@@ -477,9 +616,12 @@ func writeMigrationFile(opts generateOptions, body string, diff *schemadiff.Sche
 // a time if that timestamp is already used by an existing migration file —
 // two generates within the same wall-clock second (e.g. under test with a
 // fixed clock) must still get distinct, monotonically increasing versions.
-func nextTimestamp(dir string, t time.Time) (string, error) {
+func nextTimestamp(ctx context.Context, dir string, t time.Time) (string, error) {
 	t = t.UTC()
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		candidate := t.Format(timestampLayout)
 		matches, err := filepath.Glob(filepath.Join(dir, candidate+"_*.sql"))
 		if err != nil {
