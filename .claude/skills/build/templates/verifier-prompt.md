@@ -29,7 +29,7 @@ A throwaway clone where `task-executor` committed the changes above. You
 **inspect and run checks only** — never modify anything here, in the real
 repo, or anywhere else. Never push, never touch a remote or another clone,
 never open a pull request. `WORKSPACE/CLAUDE.md` and
-`WORKSPACE/docs/internal/sqlite-migrate — Spec MVP Doc.md` are your
+`WORKSPACE/docs/internal/sqlite-migrate-spec-mvp-doc.md` are your
 reference for what correct looks like.
 
 No lab, VM, or real-hardware hazard applies to this project. The only

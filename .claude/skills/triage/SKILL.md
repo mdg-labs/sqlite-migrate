@@ -56,7 +56,7 @@ This project is design-first: the spec doc is the ground truth for what
 should exist and why. Ground every issue in it.
 
 1. `gh repo view mdg-labs/sqlite-migrate --json nameWithOwner,defaultBranchRef` to confirm the target.
-2. **Read the spec doc section the report touches** — `docs/internal/sqlite-migrate — Spec MVP Doc.md`. Note the exact section (`Core Design Principles §3`, `Safety Model`, the Development Roadmap phase) the issue implements or changes.
+2. **Read the spec doc section the report touches** — `docs/internal/sqlite-migrate-spec-mvp-doc.md`. Note the exact section (`Core Design Principles §3`, `Safety Model`, the Development Roadmap phase) the issue implements or changes.
 3. **Check the doc's own decisions before proposing a new one.** The spec doc's "Decisions on the Remaining Risks" and "Next Steps" sections are its decision log — a report that conflicts with a recorded decision there doesn't quietly reopen it; say so in `## Constraints`. A genuine new reason to reopen one becomes its own `docs` issue that updates the spec doc as part of its acceptance criteria.
 4. Grep/Read any code, scripts or workflows the report mentions; `git log`/`git blame`/`git show` for recent history on them.
 5. `gh issue list --repo mdg-labs/sqlite-migrate --state all --search ...` for related or duplicate issues.

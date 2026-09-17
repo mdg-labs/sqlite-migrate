@@ -37,7 +37,7 @@ full isolation from other agents working on other items at the same time.
   verification, to whichever base its PR-stacking rule picks.
 - `WORKSPACE/CLAUDE.md` applies to you exactly as in the real repo — read
   it first.
-- The spec doc, `WORKSPACE/docs/internal/sqlite-migrate — Spec MVP Doc.md`,
+- The spec doc, `WORKSPACE/docs/internal/sqlite-migrate-spec-mvp-doc.md`,
   is the authority for anything the issue text doesn't spell out —
   especially its Core Design Principles, Safety Model, and (for a roadmap
   phase) the exact Deliverable/Done-when text for your phase in the

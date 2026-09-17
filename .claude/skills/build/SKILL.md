@@ -36,7 +36,7 @@ start of each wave and after each opened PR, rather than going quiet.
 
 - **No argument, or a phase number, or "next phase"** → **Roadmap mode**:
   build the Development Roadmap in the spec doc
-  (`docs/internal/sqlite-migrate — Spec MVP Doc.md`), starting from the
+  (`docs/internal/sqlite-migrate-spec-mvp-doc.md`), starting from the
   first phase with no open or merged PR against it (check
   `gh pr list --repo mdg-labs/sqlite-migrate --state all --search "Phase in:title"`
   and this repo's own `Phase N` commit trailers/tags). A phase number
