@@ -1,0 +1,4 @@
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    age INTEGER CHECK (age >= 0)
+) STRICT;

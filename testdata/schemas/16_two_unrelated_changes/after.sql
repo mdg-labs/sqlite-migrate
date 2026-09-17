@@ -1,0 +1,9 @@
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    age INTEGER
+) STRICT;
+
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    note TEXT
+) STRICT;

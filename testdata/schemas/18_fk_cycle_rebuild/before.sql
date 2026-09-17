@@ -1,0 +1,11 @@
+CREATE TABLE a (
+    id INTEGER PRIMARY KEY,
+    b_id INTEGER REFERENCES b(id),
+    tag TEXT
+) STRICT;
+
+CREATE TABLE b (
+    id INTEGER PRIMARY KEY,
+    a_id INTEGER REFERENCES a(id),
+    label TEXT
+) STRICT;
