@@ -147,14 +147,18 @@ func rebuildTable(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) 
 	}
 
 	var targetCols, sourceCols []string
-	if rowid, ok := rowidColumn(td, beforeCols, afterCols); ok {
-		targetCols = append(targetCols, rowid)
-		sourceCols = append(sourceCols, rowid)
+	rowidTarget, rowidSource, carryRowid := rowidColumn(td, beforeCols, afterCols)
+	if carryRowid {
+		targetCols = append(targetCols, rowidTarget)
+		sourceCols = append(sourceCols, rowidSource)
 	}
 	for _, c := range afterCols {
 		if c.generated {
 			// SQLite rejects an INSERT naming a generated column; its value
 			// is recomputed from the copied columns instead.
+			continue
+		}
+		if carryRowid && quoteIdent(c.name) == rowidTarget {
 			continue
 		}
 		bc, ok := beforeByName[asciiLower(c.name)]
@@ -169,7 +173,9 @@ func rebuildTable(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) 
 		sourceCols = append(sourceCols, quoteIdent(bc.name))
 	}
 
-	if len(targetCols) == 0 {
+	// A rowid mapped into a new alias column alone isn't a carried column:
+	// with every real column replaced there is still nothing to copy.
+	if len(targetCols) == 0 || (len(targetCols) == 1 && carryRowid && rowidTarget != rowidSource) {
 		return tableRebuild{}, fmt.Errorf("no column or rowid carries over from the old table, so the copy step has nothing to select")
 	}
 
@@ -193,30 +199,60 @@ func rebuildTable(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) 
 	return rb, nil
 }
 
-// rowidColumn returns the name to copy a rowid table's rowid through, when
-// the rowid isn't already carried by an INTEGER PRIMARY KEY alias column.
-// Without it the copy renumbers every row, silently breaking anything that
-// stores rowids — an FTS5 external-content index (content='t') most of all.
-// It picks the first of SQLite's three rowid spellings that no real column
-// on either side shadows; a table shadowing all three has no way to name
-// its rowid at all, so there is nothing to copy.
-func rowidColumn(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) (string, bool) {
-	if td.Before.WithoutRowID || td.After.WithoutRowID || hasRowidAlias(td.After) {
-		return "", false
+// rowidColumn returns the target and source names to copy a rowid table's
+// rowid through, when it isn't already carried by an INTEGER PRIMARY KEY
+// alias column present on both sides. Without it the copy renumbers every
+// row, silently breaking anything that stores rowids — an FTS5
+// external-content index (content='t') most of all. When the after table
+// has an alias column the before table lacks, the old rowid is copied into
+// that column. Otherwise it's copied through the first of SQLite's three
+// rowid spellings that no real column on either side shadows; a table
+// shadowing all three has no way to name its rowid at all, so there is
+// nothing to copy.
+func rowidColumn(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) (target, source string, ok bool) {
+	if td.Before.WithoutRowID || td.After.WithoutRowID {
+		return "", "", false
+	}
+	beforeTaken := make(map[string]bool, len(beforeCols))
+	for _, c := range beforeCols {
+		beforeTaken[asciiLower(c.name)] = true
+	}
+	if hasRowidAlias(td.After) {
+		alias := rowidAliasName(td.After)
+		if beforeTaken[asciiLower(alias)] {
+			return "", "", false
+		}
+		for _, name := range []string{"rowid", "_rowid_", "oid"} {
+			if !beforeTaken[name] {
+				return quoteIdent(alias), name, true
+			}
+		}
+		return "", "", false
 	}
 	taken := make(map[string]bool, len(beforeCols)+len(afterCols))
-	for _, c := range beforeCols {
-		taken[asciiLower(c.name)] = true
+	for k := range beforeTaken {
+		taken[k] = true
 	}
 	for _, c := range afterCols {
 		taken[asciiLower(c.name)] = true
 	}
 	for _, name := range []string{"rowid", "_rowid_", "oid"} {
 		if !taken[name] {
-			return name, true
+			return name, name, true
 		}
 	}
-	return "", false
+	return "", "", false
+}
+
+// rowidAliasName is the name of the single primary-key column of a table
+// hasRowidAlias has already confirmed aliases its rowid.
+func rowidAliasName(t *schemadiff.Table) string {
+	for _, c := range t.Columns {
+		if c.PrimaryKeySeq > 0 {
+			return c.Name
+		}
+	}
+	return ""
 }
 
 // hasRowidAlias reports whether a rowid table's primary key is an alias for

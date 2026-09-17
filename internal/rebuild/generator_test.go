@@ -777,6 +777,36 @@ func TestExecute_RowidPreservedWithoutIntegerPrimaryKey(t *testing.T) {
 	}
 }
 
+// TestExecute_RowidCarriedIntoNewIntegerPrimaryKey covers an INTEGER
+// PRIMARY KEY column added by the rebuild: it has no source column, so
+// without mapping the old rowid into it every row is renumbered.
+func TestExecute_RowidCarriedIntoNewIntegerPrimaryKey(t *testing.T) {
+	beforeSQL := `CREATE TABLE items (name TEXT) STRICT;`
+	afterSQL := `CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT) STRICT;`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "items")
+
+	db := openSeededDB(t, beforeSQL, `
+		INSERT INTO items (rowid, name) VALUES (1, 'a'), (5, 'b'), (9, 'c');
+	`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	want := map[string]int64{"a": 1, "b": 5, "c": 9}
+	for name, id := range want {
+		var got int64
+		if err := db.QueryRow(`SELECT id FROM items WHERE name = ?`, name).Scan(&got); err != nil {
+			t.Fatalf("query items %q: %v", name, err)
+		}
+		if got != id {
+			t.Errorf("row %q: want id %d, got %d", name, id, got)
+		}
+	}
+}
+
 // TestExecute_GeneratedColumnBecomingPlainKeepsValues covers a generated
 // column turned into an ordinary one: pragma_table_info doesn't list
 // generated columns, so without reading pragma_table_xinfo the column
