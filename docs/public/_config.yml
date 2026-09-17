@@ -1,0 +1,14 @@
+title: sqlite-migrate
+description: >-
+  A Go CLI and embeddable library that generates and safely applies SQLite
+  schema migrations from a plain-SQL schema.sql source of truth, including
+  full automatic rebuilds for changes SQLite's native ALTER TABLE can't
+  express.
+theme: minima
+markdown: kramdown
+show_excerpts: false
+header_pages:
+  - index.md
+  - cli-reference.md
+  - safety-model.md
+  - faq.md
