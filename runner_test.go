@@ -144,6 +144,86 @@ func TestApply_RollsBackFailingMigration_DatabaseByteIdentical(t *testing.T) {
 	}
 }
 
+func TestApply_RejectsMigrationContainingNULByte_DatabaseByteIdentical(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "app.db")
+	r := newRunner(t, dbPath)
+
+	init := Migration{
+		Version:  "20260101000000",
+		Slug:     "init",
+		Filename: "20260101000000_init.sql",
+		SQL:      `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;`,
+	}
+	init.Checksum = Checksum(init.SQL)
+
+	if _, err := r.Apply(ctx, []Migration{init}); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read database before corrupted attempt: %v", err)
+	}
+
+	// A migration file corrupted to contain a NUL byte partway through its
+	// SQL: modernc.org/sqlite's Exec silently stops at the first NUL byte
+	// with no error, so table b would never be created while Apply still
+	// recorded the migration as fully applied — the exact silent-truncation
+	// scenario this guard exists to refuse outright, before executing any
+	// of it.
+	corrupted := Migration{
+		Version:  "20260102000000",
+		Slug:     "corrupted",
+		Filename: "20260102000000_corrupted.sql",
+		SQL:      "CREATE TABLE a (id INTEGER PRIMARY KEY) STRICT;\x00CREATE TABLE b (id INTEGER PRIMARY KEY) STRICT;",
+	}
+	corrupted.Checksum = Checksum(corrupted.SQL)
+
+	applied, err := r.Apply(ctx, []Migration{init, corrupted})
+	if err == nil {
+		t.Fatal("Apply succeeded on a migration containing a NUL byte")
+	}
+	if !strings.Contains(err.Error(), corrupted.Filename) {
+		t.Fatalf("Apply error %q does not name the offending migration file", err.Error())
+	}
+	if len(applied) != 0 {
+		t.Fatalf("Apply reported %d applied migrations on a rejected batch, want 0", len(applied))
+	}
+
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read database after rejected attempt: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("database file changed after a migration with an embedded NUL byte was rejected; it must roll back byte-for-byte")
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var tableCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('a', 'b')`,
+	).Scan(&tableCount); err != nil {
+		t.Fatalf("query sqlite_master: %v", err)
+	}
+	if tableCount != 0 {
+		t.Fatalf("table a or b was partially created despite Apply being rejected; want 0 tables, got %d", tableCount)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatalf("query bookkeeping table: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("schema_migrations has %d rows after rejected apply, want 1 (only the seed migration)", count)
+	}
+}
+
 func TestApply_DetectsChecksumTamperingOfAppliedMigration(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "app.db")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -46,6 +47,21 @@ func TestCheckDrift_NoDriftAgainstRealDatabase(t *testing.T) {
 	}
 	if !report.Empty() {
 		t.Fatalf("CheckDrift reported drift for an identical database: %+v", report)
+	}
+}
+
+func TestReplaySchema_RejectsMigrationContainingNULByte(t *testing.T) {
+	ctx := context.Background()
+	migrations := []Migration{
+		{Version: "1", Filename: "1_init.sql", SQL: "CREATE TABLE a (id INTEGER PRIMARY KEY) STRICT;\x00CREATE TABLE b (id INTEGER PRIMARY KEY) STRICT;"},
+	}
+
+	schema, err := ReplaySchema(ctx, migrations)
+	if err == nil {
+		t.Fatalf("ReplaySchema succeeded on a migration containing a NUL byte, got schema %+v", schema)
+	}
+	if !strings.Contains(err.Error(), "1_init.sql") {
+		t.Fatalf("ReplaySchema error %q does not name the offending migration file", err.Error())
 	}
 }
 
