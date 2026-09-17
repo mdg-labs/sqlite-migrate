@@ -8,3 +8,114 @@ package sqlitemigrate
 // number, name, SQL body, and recorded checksum. Load and LoadDir parse
 // migration files (including go:embed filesystems) into Migration values
 // for Runner.Apply to consume.
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"io/fs"
+	"path"
+	"regexp"
+	"sort"
+)
+
+// filenamePattern matches the "<timestamp>_<slug>.sql" migration filename
+// convention decided in the spec doc: a sortable YYYYMMDDHHMMSS timestamp
+// is the migration's real identity, and the slug is a cosmetic,
+// human-readable label that never affects ordering or verification.
+var filenamePattern = regexp.MustCompile(`^([0-9]{14})_([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)\.sql$`)
+
+// Migration is one parsed migration file.
+type Migration struct {
+	// Version is the migration's sortable timestamp identity
+	// (YYYYMMDDHHMMSS), parsed from its filename.
+	Version string
+	// Slug is the cosmetic, human-readable part of the filename.
+	Slug string
+	// Filename is the base filename the migration was loaded from.
+	Filename string
+	// SQL is the migration's forward SQL body, exactly as read from the
+	// file — this, not the filename or a sidecar file, is what Checksum
+	// is computed over.
+	SQL string
+	// Checksum is the SHA-256 checksum of SQL, computed at load time.
+	Checksum string
+}
+
+// Load parses a single migration from filename and its SQL body read from
+// r. filename must follow the "<timestamp>_<slug>.sql" convention; only
+// its base name is significant, so callers may pass a full path.
+func Load(ctx context.Context, filename string, r io.Reader) (Migration, error) {
+	if err := ctx.Err(); err != nil {
+		return Migration{}, err
+	}
+
+	base := path.Base(filename)
+	m := filenamePattern.FindStringSubmatch(base)
+	if m == nil {
+		return Migration{}, fmt.Errorf("sqlitemigrate: %q does not match the <timestamp>_<slug>.sql migration filename convention", filename)
+	}
+
+	body, err := io.ReadAll(r)
+	if err != nil {
+		return Migration{}, fmt.Errorf("sqlitemigrate: read migration %q: %w", filename, err)
+	}
+
+	sqlText := string(body)
+	return Migration{
+		Version:  m[1],
+		Slug:     m[2],
+		Filename: base,
+		SQL:      sqlText,
+		Checksum: Checksum(sqlText),
+	}, nil
+}
+
+// LoadDir loads every migration file directly inside dir within fsys —
+// which may be an embed.FS, so a consuming binary can embed its migration
+// directory directly — parses each via Load, and returns them sorted by
+// version. It is an error for two files to share a version: a genuine
+// collision (e.g. two branches generating a migration independently) must
+// be visible immediately rather than silently resolved by file order.
+func LoadDir(ctx context.Context, fsys fs.FS, dir string) ([]Migration, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	entries, err := fs.ReadDir(fsys, dir)
+	if err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: read migration directory %q: %w", dir, err)
+	}
+
+	var migrations []Migration
+	for _, entry := range entries {
+		if entry.IsDir() || !filenamePattern.MatchString(entry.Name()) {
+			continue
+		}
+
+		f, err := fsys.Open(path.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("sqlitemigrate: open migration %q: %w", entry.Name(), err)
+		}
+		m, err := Load(ctx, entry.Name(), f)
+		closeErr := f.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("sqlitemigrate: close migration %q: %w", entry.Name(), closeErr)
+		}
+
+		migrations = append(migrations, m)
+	}
+
+	sort.Slice(migrations, func(i, j int) bool { return migrations[i].Version < migrations[j].Version })
+
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].Version == migrations[i-1].Version {
+			return nil, fmt.Errorf("sqlitemigrate: migration version %q used by both %q and %q", migrations[i].Version, migrations[i-1].Filename, migrations[i].Filename)
+		}
+	}
+
+	return migrations, nil
+}
