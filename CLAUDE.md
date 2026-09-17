@@ -5,7 +5,7 @@ schema migrations from a plain-SQL `schema.sql` source of truth, including
 full automatic rebuilds for changes SQLite's native `ALTER TABLE` can't
 express. The full design — problem statement, safety model, repository
 architecture, and the phased Development Roadmap this project is built
-from — lives in [`docs/internal/sqlite-migrate — Spec MVP Doc.md`](docs/internal/sqlite-migrate%20—%20Spec%20MVP%20Doc.md).
+from — lives in [`docs/internal/sqlite-migrate-spec-mvp-doc.md`](docs/internal/sqlite-migrate-spec-mvp-doc.md).
 Read it before touching anything; it is the single source of truth for
 *why* the code is shaped the way it is, not just what it does.
 
@@ -65,7 +65,7 @@ says which path, so `build` can still bound it precisely.
 
 **Always-shared files** — any change touching them serializes against every
 other change that does: `CLAUDE.md`, `Makefile`, `go.mod`, `go.sum`,
-`.gitignore`, `LICENSE`, `docs/internal/sqlite-migrate — Spec MVP Doc.md`
+`.gitignore`, `LICENSE`, `docs/internal/sqlite-migrate-spec-mvp-doc.md`
 (the spec itself — a change here is a design decision, not routine code).
 
 ## Spikes
