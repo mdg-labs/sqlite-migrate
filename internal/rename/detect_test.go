@@ -190,6 +190,38 @@ func TestDetect_ColumnRename_NameSimilarityOverridesPosition(t *testing.T) {
 	assertCandidates(t, got, want)
 }
 
+// Detect's doc comment promises table renames before column renames; a
+// diff mixing both kinds must come back in that order, not sorted by the
+// Kind constant's underlying int value.
+func TestDetect_MixedKinds_TableRenamesBeforeColumnRenames(t *testing.T) {
+	d := diffOf(t, `
+		CREATE TABLE orders (
+			id INTEGER PRIMARY KEY,
+			customer_name TEXT NOT NULL
+		) STRICT;
+		CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			ssn TEXT
+		) STRICT;
+	`, `
+		CREATE TABLE purchases (
+			id INTEGER PRIMARY KEY,
+			customer_name TEXT NOT NULL
+		) STRICT;
+		CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			last_login TEXT
+		) STRICT;
+	`)
+
+	got := Detect(d)
+	want := []Candidate{
+		{Kind: TableRename, From: "orders", To: "purchases"},
+		{Kind: ColumnRename, Table: "users", From: "ssn", To: "last_login"},
+	}
+	assertCandidates(t, got, want)
+}
+
 func assertCandidates(t *testing.T, got, want []Candidate) {
 	t.Helper()
 	if len(got) != len(want) {

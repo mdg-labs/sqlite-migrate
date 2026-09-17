@@ -68,7 +68,7 @@ func Detect(d *schemadiff.SchemaDiff) []Candidate {
 	sort.Slice(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		if a.Kind != b.Kind {
-			return a.Kind < b.Kind
+			return a.Kind == TableRename
 		}
 		if a.Table != b.Table {
 			return a.Table < b.Table

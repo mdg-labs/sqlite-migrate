@@ -2,6 +2,7 @@ package rename
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,11 @@ var ErrConflictingAssumeFlags = errors.New("rename: --assume-renames and --assum
 // back to treating it as a genuine drop-and-add, gated behind
 // --allow-destructive.
 //
+// in is a *bufio.Reader rather than a plain io.Reader so that Resolve can
+// share a single reader across every candidate's prompt: wrapping in fresh
+// per call would silently discard whatever the previous call had already
+// buffered but not consumed, misreading later candidates' answers.
+//
 // When flags sets an assume-* option, Confirm returns immediately without
 // touching in or out. Otherwise it prints the candidate as a
 // "Rename X to Y? [Y/n]" prompt to out and reads an answer line from in.
@@ -36,7 +42,7 @@ var ErrConflictingAssumeFlags = errors.New("rename: --assume-renames and --assum
 // capitalized "Y" default shown in the prompt. Declining ("n"/"no"), or in
 // is exhausted before any answer is read at all (no terminal attached,
 // non-interactive with no assume-* flag set), falls back to declining.
-func Confirm(in io.Reader, out io.Writer, c Candidate, flags Flags) (bool, error) {
+func Confirm(ctx context.Context, in *bufio.Reader, out io.Writer, c Candidate, flags Flags) (bool, error) {
 	if flags.AssumeRenames && flags.AssumeNoRenames {
 		return false, ErrConflictingAssumeFlags
 	}
@@ -47,13 +53,15 @@ func Confirm(in io.Reader, out io.Writer, c Candidate, flags Flags) (bool, error
 		return false, nil
 	}
 
-	reader := bufio.NewReader(in)
 	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		if _, err := fmt.Fprintf(out, "Rename %s? [Y/n] ", c.Description()); err != nil {
 			return false, err
 		}
 
-		line, err := reader.ReadString('\n')
+		line, err := in.ReadString('\n')
 		if err != nil && line == "" {
 			return false, nil
 		}
@@ -83,12 +91,14 @@ type Resolution struct {
 
 // Resolve runs Detect against d, then Confirm for every candidate it finds,
 // in Detect's deterministic order, returning each candidate paired with its
-// decision.
-func Resolve(d *schemadiff.SchemaDiff, in io.Reader, out io.Writer, flags Flags) ([]Resolution, error) {
+// decision. All candidates share one bufio.Reader over in, so scripted or
+// piped input is consumed in order across the whole run.
+func Resolve(ctx context.Context, d *schemadiff.SchemaDiff, in io.Reader, out io.Writer, flags Flags) ([]Resolution, error) {
 	candidates := Detect(d)
 	resolutions := make([]Resolution, 0, len(candidates))
+	reader := bufio.NewReader(in)
 	for _, c := range candidates {
-		confirmed, err := Confirm(in, out, c, flags)
+		confirmed, err := Confirm(ctx, reader, out, c, flags)
 		if err != nil {
 			return nil, err
 		}
