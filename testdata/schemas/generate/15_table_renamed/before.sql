@@ -1,0 +1,3 @@
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY
+) STRICT;
