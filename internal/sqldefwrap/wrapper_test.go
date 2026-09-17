@@ -147,3 +147,24 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0 
 		t.Fatalf("want a clear error naming the REFERENCES restriction, got: %v", err)
 	}
 }
+
+// TestDiff_ReferencesOnExistingColumn covers a REFERENCES clause added to a
+// column that already existed rather than one this Diff call is adding.
+// sqldef still emits it as "ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY
+// ..." — syntax SQLite's ALTER TABLE has never supported — but there is no
+// ADD COLUMN statement in this diff to fold it into, so Diff must report an
+// error instead of handing back a statement that would fail at exec time.
+func TestDiff_ReferencesOnExistingColumn(t *testing.T) {
+	current := `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER) STRICT;`
+	desired := `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id)) STRICT;`
+
+	ddls, err := New().Diff(desired, current)
+	if err == nil {
+		t.Fatalf("want an error for a REFERENCES clause on an existing column, got ddls %v", ddls)
+	}
+	if !strings.Contains(err.Error(), "ADD CONSTRAINT") && !strings.Contains(err.Error(), "foreign key") {
+		t.Fatalf("want an error naming the unsupported ADD CONSTRAINT/foreign key statement, got: %v", err)
+	}
+}
