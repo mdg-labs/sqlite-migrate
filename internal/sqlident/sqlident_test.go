@@ -27,6 +27,34 @@ func TestScanIdent(t *testing.T) {
 	}
 }
 
+// TestIsIdentByte covers issue #29: IsIdentByte must accept '$' and any
+// byte >= 0x80, matching SQLite's own unquoted-identifier grammar (verified
+// directly: CREATE TABLE foo$bar and CREATE TABLE café are both accepted
+// with their name unquoted), not just ASCII letters/digits/underscore.
+func TestIsIdentByte(t *testing.T) {
+	cases := []struct {
+		name string
+		c    byte
+		want bool
+	}{
+		{"underscore", '_', true},
+		{"ascii letter", 'a', true},
+		{"ascii digit", '5', true},
+		{"dollar sign", '$', true},
+		{"high-bit byte", 0xC3, true},
+		{"space", ' ', false},
+		{"open paren", '(', false},
+		{"double quote", '"', false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsIdentByte(c.c); got != c.want {
+				t.Fatalf("IsIdentByte(%q) = %v, want %v", c.c, got, c.want)
+			}
+		})
+	}
+}
+
 func TestUnquote(t *testing.T) {
 	cases := []struct {
 		name  string

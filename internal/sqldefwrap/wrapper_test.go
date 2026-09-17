@@ -148,6 +148,75 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0 
 	}
 }
 
+// TestDiff_NewColumnOnNonASCIITable covers issue #29: adding a column to a
+// table named with a non-ASCII identifier used to fail Diff outright with a
+// sqldef parser syntax error, even though the change is an ordinary safe
+// additive one internal/rebuild already supports for the same identifier
+// class (scenario 19).
+func TestDiff_NewColumnOnNonASCIITable(t *testing.T) {
+	current := `CREATE TABLE bücher (id INTEGER PRIMARY KEY) STRICT;`
+	desired := `CREATE TABLE bücher (id INTEGER PRIMARY KEY, titel TEXT) STRICT;`
+
+	ddls, err := New().Diff(desired, current)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	want := `ALTER TABLE "bücher" ADD COLUMN titel text`
+	if len(ddls) != 1 || ddls[0] != want {
+		t.Fatalf("ddls = %v, want [%q]", ddls, want)
+	}
+
+	db := openSeeded(t, current)
+	execAll(t, db, ddls)
+}
+
+// TestDiff_NewColumnContainingDollarSign covers issue #29's other named
+// identifier class: a column name containing '$', which sqldef's own
+// parser also rejects unquoted (scenario 20 covers the same class on the
+// internal/rebuild path).
+func TestDiff_NewColumnContainingDollarSign(t *testing.T) {
+	current := `CREATE TABLE foo$bar (id INTEGER PRIMARY KEY) STRICT;`
+	desired := `CREATE TABLE foo$bar (id INTEGER PRIMARY KEY, "titel$x" TEXT) STRICT;`
+
+	ddls, err := New().Diff(desired, current)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	want := `ALTER TABLE "foo$bar" ADD COLUMN "titel$x" text`
+	if len(ddls) != 1 || ddls[0] != want {
+		t.Fatalf("ddls = %v, want [%q]", ddls, want)
+	}
+
+	db := openSeeded(t, current)
+	execAll(t, db, ddls)
+}
+
+// TestDiff_NewColumnWithReferencesOnNonASCIITable covers the fold path
+// (foldForeignKeysIntoAddColumn) with a non-ASCII table/column name, since
+// quoteExoticIdentifiers changes what sqldef's raw output looks like for
+// this identifier class and the fold logic re-parses that output itself.
+func TestDiff_NewColumnWithReferencesOnNonASCIITable(t *testing.T) {
+	current := `CREATE TABLE bücher (id INTEGER PRIMARY KEY) STRICT;
+CREATE TABLE orders (id INTEGER PRIMARY KEY) STRICT;`
+	desired := `CREATE TABLE bücher (id INTEGER PRIMARY KEY) STRICT;
+CREATE TABLE orders (id INTEGER PRIMARY KEY, buch_id INTEGER REFERENCES bücher(id)) STRICT;`
+
+	ddls, err := New().Diff(desired, current)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	want := `ALTER TABLE orders ADD COLUMN buch_id integer REFERENCES "bücher" (id)`
+	if len(ddls) != 1 || ddls[0] != want {
+		t.Fatalf("ddls = %v, want [%q]", ddls, want)
+	}
+
+	db := openSeeded(t, current)
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatalf("enable foreign_keys: %v", err)
+	}
+	execAll(t, db, ddls)
+}
+
 // TestDiff_ReferencesOnExistingColumn covers a REFERENCES clause added to a
 // column that already existed rather than one this Diff call is adding.
 // sqldef still emits it as "ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY

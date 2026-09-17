@@ -9,8 +9,13 @@ package sqlident
 import "strings"
 
 // IsIdentByte reports whether c can appear in an unquoted SQL identifier.
+// SQLite's own tokenizer treats '$' and any byte with the high bit set
+// (part of a multi-byte UTF-8 sequence, or any raw byte >= 0x80) as an
+// identifier byte too, not just ASCII letters/digits/underscore (verified
+// directly: CREATE TABLE "foo$bar" and CREATE TABLE café (...) are both
+// accepted with their name unquoted).
 func IsIdentByte(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80
 }
 
 // QuoteIdent double-quote-wraps a SQL identifier, doubling any embedded
