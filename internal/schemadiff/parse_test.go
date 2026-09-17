@@ -167,6 +167,218 @@ func TestParse_ExpressionIndex(t *testing.T) {
 	}
 }
 
+func TestParse_VirtualTableFTS5ExemptFromSTRICT(t *testing.T) {
+	schema := mustParse(t, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE VIRTUAL TABLE docs USING fts5(body);
+	`)
+
+	docs, ok := schema.Tables["docs"]
+	if !ok {
+		t.Fatal("missing docs table")
+	}
+	if !docs.Virtual {
+		t.Error("want docs.Virtual = true")
+	}
+	if len(docs.ForeignKeys) != 0 || len(docs.Indexes) != 0 {
+		t.Errorf("want a virtual table to carry no ForeignKeys/Indexes, got %+v", docs)
+	}
+	if got := diffColumnNames(docs.Columns); len(got) != 1 || got[0] != "body" {
+		t.Errorf("want a virtual table's Columns populated from pragma_table_info, got %v", got)
+	}
+}
+
+func TestParse_VirtualTableFTS5ShadowTablesAreHidden(t *testing.T) {
+	schema := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body);`)
+
+	for _, shadow := range []string{"docs_data", "docs_idx", "docs_content", "docs_docsize", "docs_config"} {
+		if _, ok := schema.Tables[shadow]; ok {
+			t.Errorf("want shadow table %q hidden from the parsed schema, got it present", shadow)
+		}
+	}
+	if len(schema.Tables) != 1 {
+		t.Fatalf("want exactly 1 table (docs), got %v", schema.SortedTableNames())
+	}
+}
+
+func TestParse_TableNameResemblingContentlessFTS5ShadowTableIsNotHidden(t *testing.T) {
+	// content='' puts fts5 in contentless mode, where the module never
+	// creates a <table>_content table of its own; an ordinary table that
+	// happens to have that name is real and must stay in the schema.
+	schema := mustParse(t, `
+		CREATE VIRTUAL TABLE docs USING fts5(body, content='');
+		CREATE TABLE docs_content (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+	`)
+
+	if _, ok := schema.Tables["docs_content"]; !ok {
+		t.Fatalf("want docs_content present despite its shadow-matching name, got tables %v", schema.SortedTableNames())
+	}
+	if len(schema.Tables) != 2 {
+		t.Fatalf("want exactly 2 tables (docs, docs_content), got %v", schema.SortedTableNames())
+	}
+}
+
+func TestParse_TableNameResemblingContentlessFTS5ShadowTable_RejectsNonStrict(t *testing.T) {
+	_, err := Parse(context.Background(), `
+		CREATE VIRTUAL TABLE docs USING fts5(body, content='');
+		CREATE TABLE docs_content (id INTEGER PRIMARY KEY, v TEXT);
+	`)
+	var notStrict *NotStrictError
+	if !errors.As(err, &notStrict) {
+		t.Fatalf("want *NotStrictError for the real, non-STRICT docs_content table, got %v", err)
+	}
+	if notStrict.Table != "docs_content" {
+		t.Errorf("want NotStrictError.Table = docs_content, got %q", notStrict.Table)
+	}
+}
+
+func TestParse_ExternalContentFTS5TableIsNotHidden(t *testing.T) {
+	// In external-content mode the module never creates its own
+	// <table>_content table either — it reads directly from the named
+	// table, which is exactly the shadow-matching name here.
+	schema := mustParse(t, `
+		CREATE TABLE docs_content (id INTEGER PRIMARY KEY, body TEXT) STRICT;
+		CREATE VIRTUAL TABLE docs USING fts5(body, content='docs_content', content_rowid='id');
+	`)
+
+	if _, ok := schema.Tables["docs_content"]; !ok {
+		t.Fatalf("want the external-content table docs_content present, got tables %v", schema.SortedTableNames())
+	}
+}
+
+func TestParse_TableNameResemblingDocsizeZeroFTS5ShadowTableIsNotHidden(t *testing.T) {
+	// columnsize=0 means the module never creates a <table>_docsize table.
+	schema := mustParse(t, `
+		CREATE VIRTUAL TABLE docs USING fts5(body, columnsize=0);
+		CREATE TABLE docs_docsize (id INTEGER PRIMARY KEY) STRICT;
+	`)
+
+	if _, ok := schema.Tables["docs_docsize"]; !ok {
+		t.Fatalf("want docs_docsize present despite its shadow-matching name, got tables %v", schema.SortedTableNames())
+	}
+}
+
+func TestDiff_Destructive_DroppingTableWithFTS5ShadowMatchingNameIsDestructive(t *testing.T) {
+	before := mustParse(t, `
+		CREATE VIRTUAL TABLE docs USING fts5(body, content='');
+		CREATE TABLE docs_content (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+	`)
+	after := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body, content='');`)
+
+	d := Diff(before, after)
+	if len(d.RemovedTables) != 1 || d.RemovedTables[0].Name != "docs_content" {
+		t.Fatalf("want RemovedTables=[docs_content], got %+v", d.RemovedTables)
+	}
+	if c := Classify(d); c.Verdict != Destructive {
+		t.Fatalf("want dropping a real table with a shadow-matching name to classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_Destructive_DroppingColumnFromTableWithFTS5ShadowMatchingNameIsDestructive(t *testing.T) {
+	before := mustParse(t, `
+		CREATE VIRTUAL TABLE docs USING fts5(body, content='');
+		CREATE TABLE docs_content (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+	`)
+	after := mustParse(t, `
+		CREATE VIRTUAL TABLE docs USING fts5(body, content='');
+		CREATE TABLE docs_content (id INTEGER PRIMARY KEY) STRICT;
+	`)
+
+	c := Classify(Diff(before, after))
+	if c.Verdict != Destructive {
+		t.Fatalf("want dropping a column from a table with a shadow-matching name to classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+	if got := c.RemovedColumns["docs_content"]; len(got) != 1 || got[0] != "v" {
+		t.Fatalf("want RemovedColumns[docs_content]=[v], got %+v", c.RemovedColumns)
+	}
+}
+
+func TestDiff_Destructive_FTS5ColumnDropped(t *testing.T) {
+	before := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body, title);`)
+	after := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body);`)
+
+	c := Classify(Diff(before, after))
+	if c.Verdict != Destructive {
+		t.Fatalf("want dropping an fts5 column to classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+	if got := c.RemovedColumns["docs"]; len(got) != 1 || got[0] != "title" {
+		t.Fatalf("want RemovedColumns[docs]=[title], got %+v", c.RemovedColumns)
+	}
+}
+
+func TestDiff_Safe_FTS5ColumnAdded(t *testing.T) {
+	before := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body);`)
+	after := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body, title);`)
+
+	c := Classify(Diff(before, after))
+	if c.Verdict != Safe {
+		t.Fatalf("want adding an fts5 column to classify Safe, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_Destructive_RTreeColumnDropped(t *testing.T) {
+	before := mustParse(t, `CREATE VIRTUAL TABLE bbox USING rtree(id, minx, maxx, miny, maxy);`)
+	after := mustParse(t, `CREATE VIRTUAL TABLE bbox USING rtree(id, minx, maxx);`)
+
+	c := Classify(Diff(before, after))
+	if c.Verdict != Destructive {
+		t.Fatalf("want dropping rtree columns to classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+	if got := c.RemovedColumns["bbox"]; len(got) != 2 {
+		t.Fatalf("want 2 RemovedColumns[bbox], got %+v", c.RemovedColumns)
+	}
+}
+
+func TestDiff_Destructive_VirtualToOrdinaryTableColumnRemoved(t *testing.T) {
+	before := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body, title);`)
+	after := mustParse(t, `CREATE TABLE docs (body TEXT) STRICT;`)
+
+	c := Classify(Diff(before, after))
+	if c.Verdict != Destructive {
+		t.Fatalf("want replacing a virtual table with an ordinary one that drops a column to classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_VirtualToOrdinaryTableSameColumnsStillShowsChange(t *testing.T) {
+	before := mustParse(t, `CREATE VIRTUAL TABLE docs USING fts5(body);`)
+	after := mustParse(t, `CREATE TABLE docs (body TEXT) STRICT;`)
+
+	td := findTableDiff(t, Diff(before, after), "docs")
+	if td.Empty() {
+		t.Fatalf("want a virtual-to-ordinary table change to be visible in the diff even when the column names match, got empty TableDiff")
+	}
+}
+
+func TestDiff_VirtualTable_AddedRemovedChanged(t *testing.T) {
+	withoutDocs := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`)
+	withDocs := mustParse(t, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE VIRTUAL TABLE docs USING fts5(body);
+	`)
+	withChangedDocs := mustParse(t, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE VIRTUAL TABLE docs USING fts5(body, title);
+	`)
+
+	added := Diff(withoutDocs, withDocs)
+	if len(added.AddedTables) != 1 || added.AddedTables[0].Name != "docs" {
+		t.Fatalf("want AddedTables=[docs], got %+v", added.AddedTables)
+	}
+
+	removed := Diff(withDocs, withoutDocs)
+	if len(removed.RemovedTables) != 1 || removed.RemovedTables[0].Name != "docs" {
+		t.Fatalf("want RemovedTables=[docs], got %+v", removed.RemovedTables)
+	}
+	if c := Classify(removed); c.Verdict != Destructive {
+		t.Fatalf("want dropping a virtual table to classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+
+	td := findTableDiff(t, Diff(withDocs, withChangedDocs), "docs")
+	if !td.SQLChanged {
+		t.Fatalf("want a changed fts5 column list to register as SQLChanged, got %+v", td)
+	}
+}
+
 func TestParse_TableNamesResemblingSQLiteInternalTablesAreNotHidden(t *testing.T) {
 	schema := mustParse(t, `
 		CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;

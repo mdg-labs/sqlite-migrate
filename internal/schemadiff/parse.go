@@ -34,12 +34,19 @@ func (s *Schema) SortedTableNames() []string {
 }
 
 // Table is one table's structure as read back from sqlite_master and the
-// table/foreign-key/index PRAGMAs.
+// table/foreign-key/index PRAGMAs. A virtual table (CREATE VIRTUAL TABLE,
+// e.g. an FTS5 or R-Tree index) has Virtual set and no ForeignKeys or
+// Indexes: those belong to SQLite's ordinary constraint model, which a
+// virtual table module doesn't participate in. Its Columns are still
+// populated from pragma_table_info, which works for FTS5 and R-Tree, so a
+// column a virtual table module loses is still visible to Classify exactly
+// like an ordinary table's.
 type Table struct {
 	Name         string
 	SQL          string
 	Strict       bool
 	WithoutRowID bool
+	Virtual      bool
 	Columns      []Column
 	ForeignKeys  []ForeignKey
 	Indexes      []Index
@@ -110,7 +117,8 @@ func (e *NotStrictError) Error() string {
 // database and reads back its structure (tables, columns, indexes, foreign
 // keys) via sqlite_master and PRAGMA introspection, reusing SQLite's own
 // parser instead of hand-writing a SQL grammar. It returns a *NotStrictError
-// if any table isn't declared STRICT.
+// if any ordinary table isn't declared STRICT; a virtual table (e.g. FTS5,
+// R-Tree) is exempt, since SQLite never allows one to be declared STRICT.
 func Parse(ctx context.Context, schemaSQL string) (*Schema, error) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -135,7 +143,7 @@ func Parse(ctx context.Context, schemaSQL string) (*Schema, error) {
 
 	schema := &Schema{Tables: make(map[string]*Table, len(tableMeta))}
 	for _, meta := range tableMeta {
-		if !meta.strict {
+		if !meta.strict && !meta.virtual {
 			return nil, &NotStrictError{Table: meta.name}
 		}
 
@@ -144,19 +152,22 @@ func Parse(ctx context.Context, schemaSQL string) (*Schema, error) {
 			SQL:          meta.sql,
 			Strict:       meta.strict,
 			WithoutRowID: meta.withoutRowID,
+			Virtual:      meta.virtual,
 		}
 
 		table.Columns, err = readColumns(ctx, db, meta.name)
 		if err != nil {
 			return nil, err
 		}
-		table.ForeignKeys, err = readForeignKeys(ctx, db, meta.name)
-		if err != nil {
-			return nil, err
-		}
-		table.Indexes, err = readIndexes(ctx, db, meta.name)
-		if err != nil {
-			return nil, err
+		if !meta.virtual {
+			table.ForeignKeys, err = readForeignKeys(ctx, db, meta.name)
+			if err != nil {
+				return nil, err
+			}
+			table.Indexes, err = readIndexes(ctx, db, meta.name)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		schema.Tables[meta.name] = table
@@ -170,11 +181,25 @@ type tableMeta struct {
 	sql          string
 	strict       bool
 	withoutRowID bool
+	virtual      bool
 }
 
 func readTableMeta(ctx context.Context, db *sql.DB) ([]tableMeta, error) {
+	// pragma_table_list.type distinguishes an ordinary table ("table") from
+	// a virtual table's own row ("virtual") and, in principle, the extra
+	// tables a virtual table module creates to hold its data ("shadow",
+	// e.g. FTS5's <table>_data/_idx/_content/_docsize/_config). In
+	// practice SQLite assigns "shadow" to any table whose name matches a
+	// module's naming pattern for a virtual table present in the schema,
+	// whether or not that module actually created it — an ordinary table
+	// named docs_content sitting next to a contentless or external-content
+	// "docs" FTS5 table gets "shadow" too. Rather than trust that flag
+	// directly, the real shadow tables for each virtual table are
+	// determined below by replaying that virtual table's own
+	// CREATE VIRTUAL TABLE statement alone; only names that appear there
+	// are excluded from schema.sql's table set.
 	rows, err := db.QueryContext(ctx, `
-		SELECT sqlite_master.name, sqlite_master.sql, pragma_table_list.strict, pragma_table_list.wr
+		SELECT sqlite_master.name, sqlite_master.sql, pragma_table_list.strict, pragma_table_list.wr, pragma_table_list.type
 		FROM sqlite_master
 		JOIN pragma_table_list ON pragma_table_list.name = sqlite_master.name
 		WHERE sqlite_master.type = 'table'
@@ -184,23 +209,98 @@ func readTableMeta(ctx context.Context, db *sql.DB) ([]tableMeta, error) {
 	if err != nil {
 		return nil, fmt.Errorf("schemadiff: read table list: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
 
 	var out []tableMeta
 	for rows.Next() {
 		var m tableMeta
 		var strict, wr int
-		if err := rows.Scan(&m.name, &m.sql, &strict, &wr); err != nil {
+		var tableType string
+		if err := rows.Scan(&m.name, &m.sql, &strict, &wr, &tableType); err != nil {
+			_ = rows.Close()
 			return nil, fmt.Errorf("schemadiff: scan table list row: %w", err)
 		}
 		m.strict = strict != 0
 		m.withoutRowID = wr != 0
+		m.virtual = tableType == "virtual"
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return nil, fmt.Errorf("schemadiff: read table list: %w", err)
 	}
-	return out, nil
+	// rows must be closed before issuing the per-virtual-table shadow-name
+	// probe below: each probe opens its own separate database, but with
+	// the connection pool pinned to one connection (see Parse), a second
+	// query against db issued while this one is still open would block
+	// forever waiting for a connection the pool will never hand back.
+	_ = rows.Close()
+
+	shadow, err := shadowTableNames(ctx, out)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := out[:0]
+	for _, m := range out {
+		if shadow[m.name] {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered, nil
+}
+
+// shadowTableNames returns the set of table names that are genuinely owned
+// by a virtual table module among tables, determined by replaying each
+// virtual table's own CREATE VIRTUAL TABLE statement alone in a fresh,
+// empty database and reading back which tables that produced.
+func shadowTableNames(ctx context.Context, tables []tableMeta) (map[string]bool, error) {
+	names := make(map[string]bool)
+	for _, m := range tables {
+		if !m.virtual {
+			continue
+		}
+		moduleTables, err := readModuleShadowTableNames(ctx, m.sql)
+		if err != nil {
+			return nil, err
+		}
+		for name := range moduleTables {
+			names[name] = true
+		}
+	}
+	return names, nil
+}
+
+func readModuleShadowTableNames(ctx context.Context, virtualTableSQL string) (map[string]bool, error) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, fmt.Errorf("schemadiff: open shadow-table probe database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, virtualTableSQL); err != nil {
+		return nil, fmt.Errorf("schemadiff: replay virtual table for shadow-table detection: %w", err)
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_list WHERE type = 'shadow'`)
+	if err != nil {
+		return nil, fmt.Errorf("schemadiff: read shadow table names: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	names := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("schemadiff: scan shadow table name: %w", err)
+		}
+		names[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("schemadiff: read shadow table names: %w", err)
+	}
+	return names, nil
 }
 
 func readColumns(ctx context.Context, db *sql.DB, table string) ([]Column, error) {

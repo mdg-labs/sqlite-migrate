@@ -268,3 +268,157 @@ func TestDiff_NoChanges(t *testing.T) {
 		t.Fatalf("want empty diff for identical schemas, got %+v", d)
 	}
 }
+
+// TestDiff_SQLChanged_AddColumnReplayNoFalsePositive builds "after" by
+// actually replaying a CREATE TABLE followed by an ALTER TABLE ADD COLUMN
+// through Parse, so the table's stored sqlite_master.sql is SQLite's own
+// splice of the new column definition just before the closing paren — not
+// a hand-written approximation of it.
+func TestDiff_SQLChanged_AddColumnReplayNoFalsePositive(t *testing.T) {
+	declared := mustParse(t, `
+		CREATE TABLE t (
+			id INTEGER PRIMARY KEY,
+			name TEXT
+		) STRICT;
+	`)
+	replayed := mustParse(t, `
+		CREATE TABLE t (
+			id INTEGER PRIMARY KEY,
+			name TEXT
+		) STRICT;
+		ALTER TABLE t ADD COLUMN email TEXT;
+	`)
+	full := mustParse(t, `
+		CREATE TABLE t (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			email TEXT
+		) STRICT;
+	`)
+
+	d := Diff(full, replayed)
+	if !d.Empty() {
+		t.Fatalf("want no diff between a directly-declared table and the same table built via ADD COLUMN replay, got %+v", d)
+	}
+
+	// declared/replayed differ by exactly the added column, and must still
+	// be reported as such — normalization must not hide real changes.
+	td := findTableDiff(t, Diff(declared, replayed), "t")
+	if len(td.AddedColumns) != 1 || td.AddedColumns[0].Name != "email" {
+		t.Fatalf("want AddedColumns=[email], got %+v", td.AddedColumns)
+	}
+}
+
+func TestDiff_SQLChanged_KeywordCaseCommentsAndQuotingAreIgnored(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT) STRICT;`)
+	after := mustParse(t, `
+		create table t ( -- table t
+			"id" integer primary key, /* pk */
+			`+"`name`"+` text
+		) strict;
+	`)
+
+	d := Diff(before, after)
+	if !d.Empty() {
+		t.Fatalf("want keyword-case/comment/quoting differences to be invisible, got %+v", d)
+	}
+}
+
+func TestDiff_SQLChanged_DoubleQuotedLiteralCaseChangeDetected(t *testing.T) {
+	// SQLite's double-quoted string (DQS) fallback treats "Active" as a
+	// string literal here, since it names no column — a change to its
+	// case is a genuine change to the CHECK constraint's behavior and must
+	// not be normalized away as if it were just a quoting style.
+	before := mustParse(t, `CREATE TABLE t (s TEXT CHECK (s IN ("Active","Inactive"))) STRICT;`)
+	after := mustParse(t, `CREATE TABLE t (s TEXT CHECK (s IN ("active","inactive"))) STRICT;`)
+
+	td := findTableDiff(t, Diff(before, after), "t")
+	if !td.SQLChanged {
+		t.Fatal("want a letter-case change inside a double-quoted string literal to still register as SQLChanged")
+	}
+}
+
+func TestDiff_SQLChanged_GenuineCollateChangeDetected(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE) STRICT;`)
+	after := mustParse(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE BINARY) STRICT;`)
+
+	td := findTableDiff(t, Diff(before, after), "t")
+	if !td.SQLChanged {
+		t.Fatal("want a genuine COLLATE change to still register as SQLChanged")
+	}
+}
+
+func TestDiff_TableCaseOnlyRenameIsSafe(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE Users (id INTEGER PRIMARY KEY) STRICT;`)
+	after := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`)
+
+	d := Diff(before, after)
+	if !d.Empty() {
+		t.Fatalf("want a table-case-only rename to be invisible to Diff, got %+v", d)
+	}
+	if c := Classify(d); c.Verdict != Safe {
+		t.Fatalf("want table-case-only rename to classify Safe, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_ColumnCaseOnlyRenameIsSafe(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, Email TEXT) STRICT;`)
+	after := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT) STRICT;`)
+
+	d := Diff(before, after)
+	if !d.Empty() {
+		t.Fatalf("want a column-case-only rename to be invisible to Diff, got %+v", d)
+	}
+	if c := Classify(d); c.Verdict != Safe {
+		t.Fatalf("want column-case-only rename to classify Safe, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_ForeignKeyTargetTableCaseOnlyChangeIsSafe(t *testing.T) {
+	before := mustParse(t, `
+		CREATE TABLE Users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES Users(id)) STRICT;
+	`)
+	after := mustParse(t, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id)) STRICT;
+	`)
+
+	d := Diff(before, after)
+	if !d.Empty() {
+		t.Fatalf("want a foreign-key-target-case-only change to be invisible to Diff, got %+v", d)
+	}
+	if c := Classify(d); c.Verdict != Safe {
+		t.Fatalf("want FK-target-case-only change to classify Safe, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_Destructive_TableDroppedAmongCaseOnlyRenames(t *testing.T) {
+	before := mustParse(t, `
+		CREATE TABLE Users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE TABLE Sessions (id INTEGER PRIMARY KEY) STRICT;
+	`)
+	after := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`)
+
+	d := Diff(before, after)
+	if len(d.RemovedTables) != 1 || d.RemovedTables[0].Name != "Sessions" {
+		t.Fatalf("want RemovedTables=[Sessions], got %+v", d.RemovedTables)
+	}
+	if c := Classify(d); c.Verdict != Destructive {
+		t.Fatalf("want a genuine table drop to still classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+func TestDiff_Destructive_ColumnDroppedAmongCaseOnlyRenames(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, Email TEXT, Nickname TEXT) STRICT;`)
+	after := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT) STRICT;`)
+
+	d := Diff(before, after)
+	td := findTableDiff(t, d, "users")
+	if len(td.RemovedColumns) != 1 || td.RemovedColumns[0].Name != "Nickname" {
+		t.Fatalf("want RemovedColumns=[Nickname], got %+v", td.RemovedColumns)
+	}
+	if c := Classify(d); c.Verdict != Destructive {
+		t.Fatalf("want a genuine column drop to still classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+}
