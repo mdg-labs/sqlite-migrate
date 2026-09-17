@@ -256,6 +256,27 @@ func mergeAffected(a, b affected) affected {
 	return affected{views: merge(a.views, b.views), triggers: merge(a.triggers, b.triggers)}
 }
 
+// stillDefined is the subset of dropped that cat still defines, each with
+// cat's definition rather than the dropped one: an object can reference a
+// rebuilt table only on the before side (so it's dropped) yet survive with
+// a changed definition, and must come back regardless.
+func stillDefined(dropped affected, cat catalog) affected {
+	pick := func(xs, defs []catalogObject) []catalogObject {
+		byKey := make(map[string]catalogObject, len(defs))
+		for _, d := range defs {
+			byKey[asciiLower(d.name)] = d
+		}
+		var out []catalogObject
+		for _, x := range xs {
+			if d, ok := byKey[asciiLower(x.name)]; ok {
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+	return affected{views: pick(dropped.views, cat.views), triggers: pick(dropped.triggers, cat.triggers)}
+}
+
 // referencesAny reports whether sql names any identifier in names.
 func referencesAny(sql string, names map[string]bool) bool {
 	for name := range names {
@@ -282,12 +303,12 @@ func dropAffectedStatements(aff affected) []string {
 	return stmts
 }
 
-// recreateAffectedStatements recreates what dropAffectedStatements dropped,
-// once every rebuilt table is back in place under its original name. Views
-// are recreated first, in dependency order (a view built on another
-// affected view is recreated after the view it selects from), since a
-// trigger's body can select from a view but a view can't reference a
-// trigger.
+// recreateAffectedStatements recreates what dropAffectedStatements dropped
+// and the after schema still defines (see stillDefined), once every rebuilt
+// table is back in place under its original name. Views are recreated
+// first, in dependency order (a view built on another affected view is
+// recreated after the view it selects from), since a trigger's body can
+// select from a view but a view can't reference a trigger.
 func recreateAffectedStatements(aff affected) []string {
 	var stmts []string
 	for _, v := range topoSortViews(aff.views) {

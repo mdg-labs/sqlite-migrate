@@ -830,3 +830,68 @@ func TestExecute_PlainColumnBecomingGeneratedRebuilds(t *testing.T) {
 		t.Errorf("want recomputed total 5, got %d", total)
 	}
 }
+
+// TestExecute_ObjectsNoLongerReferencingRebuiltTableAreRecreated covers a
+// view and a trigger that reference the rebuilt table only in the before
+// schema: they must be dropped for the rebuild, and still come back with
+// their after-schema definitions.
+func TestExecute_ObjectsNoLongerReferencingRebuiltTableAreRecreated(t *testing.T) {
+	beforeSQL := `
+		CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT) STRICT;
+		CREATE TABLE u (id INTEGER PRIMARY KEY, b TEXT) STRICT;
+		CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT) STRICT;
+		CREATE VIEW v AS SELECT id, a FROM t;
+		CREATE TRIGGER trg AFTER INSERT ON t
+		BEGIN
+			INSERT INTO audit (note) VALUES ('t');
+		END;
+	`
+	afterSQL := `
+		CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER) STRICT;
+		CREATE TABLE u (id INTEGER PRIMARY KEY, b TEXT) STRICT;
+		CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT) STRICT;
+		CREATE VIEW v AS SELECT id, b FROM u;
+		CREATE TRIGGER trg AFTER INSERT ON u
+		BEGIN
+			INSERT INTO audit (note) VALUES ('u');
+		END;
+	`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "t")
+
+	db := openSeededDB(t, beforeSQL, `INSERT INTO t (id, a) VALUES (1, '7'); INSERT INTO u (id, b) VALUES (1, 'x');`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	var b string
+	if err := db.QueryRow(`SELECT b FROM v WHERE id = 1`).Scan(&b); err != nil {
+		t.Fatalf("query recreated view: %v", err)
+	}
+	if b != "x" {
+		t.Errorf("want view to select from u (b = x), got %q", b)
+	}
+
+	if _, err := db.Exec(`DELETE FROM audit; INSERT INTO t (id, a) VALUES (2, 8); INSERT INTO u (id, b) VALUES (2, 'y');`); err != nil {
+		t.Fatalf("insert after rebuild: %v", err)
+	}
+	var notes string
+	if err := db.QueryRow(`SELECT group_concat(note) FROM audit`).Scan(&notes); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if notes != "u" {
+		t.Errorf("want trigger recreated on u only (audit = u), got %q", notes)
+	}
+}
+
+func TestStatements_NoCarriedColumnsIsAnError(t *testing.T) {
+	beforeSQL := `CREATE TABLE x (a INTEGER PRIMARY KEY, b INTEGER) STRICT;`
+	afterSQL := `CREATE TABLE x (c INTEGER PRIMARY KEY, d TEXT) STRICT;`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "x")
+
+	if _, err := Statements(context.Background(), beforeSQL, afterSQL, diffs); err == nil {
+		t.Fatal("want an error when no column carries over, got nil")
+	}
+}

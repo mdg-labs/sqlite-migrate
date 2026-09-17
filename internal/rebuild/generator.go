@@ -31,6 +31,11 @@ import (
 // runtime's foreign_key_check-at-commit-only design (Runner.Apply, Phase
 // 5), not by a topological order that can't exist for a cycle.
 //
+// Every trigger and view the output drops is also recreated from its
+// after-schema definition if the after schema still defines it, so the
+// output owns those objects outright: a caller combining it with other
+// migration statements must not create or drop them again.
+//
 // The returned SQL contains only the rebuild DDL/DML statements — no
 // PRAGMA or transaction wrapping, since Runner.Apply wraps every migration
 // file in one transaction with foreign keys suspended, uniformly for every
@@ -82,8 +87,8 @@ func Statements(ctx context.Context, beforeSchemaSQL, afterSchemaSQL string, dif
 		prepared[i] = rb
 	}
 
-	recreate := affectedObjects(tableNames, afterCat)
-	drop := mergeAffected(affectedObjects(tableNames, beforeCat), recreate)
+	drop := mergeAffected(affectedObjects(tableNames, beforeCat), affectedObjects(tableNames, afterCat))
+	recreate := stillDefined(drop, afterCat)
 
 	var stmts []string
 	// Every trigger or view that references a rebuilt table — or another
@@ -162,6 +167,10 @@ func rebuildTable(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) 
 		}
 		targetCols = append(targetCols, quoteIdent(c.name))
 		sourceCols = append(sourceCols, quoteIdent(bc.name))
+	}
+
+	if len(targetCols) == 0 {
+		return tableRebuild{}, fmt.Errorf("no column or rowid carries over from the old table, so the copy step has nothing to select")
 	}
 
 	copySQL := fmt.Sprintf(
