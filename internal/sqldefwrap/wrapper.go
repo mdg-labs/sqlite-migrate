@@ -43,8 +43,8 @@ func (sqldefDiffer) Diff(desiredDDL, currentDDL string) ([]string, error) {
 	ddls, err := schema.GenerateIdempotentDDLs(
 		schema.GeneratorModeSQLite3,
 		database.NewParser(parser.ParserModeSQLite3),
-		desiredDDL,
-		currentDDL,
+		quoteExoticIdentifiers(desiredDDL),
+		quoteExoticIdentifiers(currentDDL),
 		database.GeneratorConfig{},
 		"",
 	)
@@ -52,6 +52,85 @@ func (sqldefDiffer) Diff(desiredDDL, currentDDL string) ([]string, error) {
 		return nil, fmt.Errorf("sqldefwrap: generate DDLs: %w", err)
 	}
 	return foldForeignKeysIntoAddColumn(ddls)
+}
+
+// quoteExoticIdentifiers double-quotes every bare (unquoted) identifier run
+// in sql that contains '$' or a non-ASCII byte, leaving everything else —
+// keywords, ASCII-only bare identifiers, string/quoted-identifier literals,
+// comments — untouched. sqldef's own SQLite parser only recognizes ASCII
+// letters/digits/underscore in an unquoted identifier and otherwise fails
+// outright with a syntax error, even though SQLite itself accepts both (see
+// internal/sqlident.IsIdentByte); quoting only ahead of the call into
+// sqldef, and only the identifiers that need it, gets its input past that
+// parser without changing anything about its output for ordinary schemas.
+func quoteExoticIdentifiers(sql string) string {
+	var b strings.Builder
+	n := len(sql)
+	for i := 0; i < n; {
+		c := sql[i]
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			j := sqlident.ScanQuoted(sql, i, c)
+			b.WriteString(sql[i:j])
+			i = j
+		case c == '[':
+			j := strings.IndexByte(sql[i:], ']')
+			if j < 0 {
+				b.WriteString(sql[i:])
+				i = n
+			} else {
+				b.WriteString(sql[i : i+j+1])
+				i += j + 1
+			}
+		case c == '-' && i+1 < n && sql[i+1] == '-':
+			j := strings.IndexByte(sql[i:], '\n')
+			if j < 0 {
+				b.WriteString(sql[i:])
+				i = n
+			} else {
+				b.WriteString(sql[i : i+j+1])
+				i += j + 1
+			}
+		case c == '/' && i+1 < n && sql[i+1] == '*':
+			j := strings.Index(sql[i+2:], "*/")
+			if j < 0 {
+				b.WriteString(sql[i:])
+				i = n
+			} else {
+				end := i + 2 + j + 2
+				b.WriteString(sql[i:end])
+				i = end
+			}
+		case sqlident.IsIdentByte(c):
+			j := i + 1
+			for j < n && sqlident.IsIdentByte(sql[j]) {
+				j++
+			}
+			ident := sql[i:j]
+			if needsIdentQuoting(ident) {
+				b.WriteString(sqlident.QuoteIdent(ident))
+			} else {
+				b.WriteString(ident)
+			}
+			i = j
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// needsIdentQuoting reports whether ident (an unquoted identifier run
+// scanned by quoteExoticIdentifiers) contains a byte sqldef's own SQLite
+// parser rejects in an unquoted identifier: '$' or any byte >= 0x80.
+func needsIdentQuoting(ident string) bool {
+	for i := 0; i < len(ident); i++ {
+		if ident[i] == '$' || ident[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
 }
 
 // parseAddColumn parses ddl as "ALTER TABLE <table> ADD COLUMN <column>

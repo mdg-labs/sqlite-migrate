@@ -431,9 +431,9 @@ func hasAutoincrement(sql string) bool {
 				return false
 			}
 			i += j + 1
-		case isIdentByte(c):
+		case sqlident.IsIdentByte(c):
 			j := i
-			for j < n && isIdentByte(sql[j]) {
+			for j < n && sqlident.IsIdentByte(sql[j]) {
 				j++
 			}
 			if strings.EqualFold(sql[i:j], "autoincrement") {
@@ -498,7 +498,7 @@ func containsIdentifierWord(lowerHaystack, lowerNeedle string) bool {
 		if afterPos < len(lowerHaystack) {
 			after = lowerHaystack[afterPos]
 		}
-		if !isIdentByte(before) && !isIdentByte(after) {
+		if !sqlident.IsIdentByte(before) && !sqlident.IsIdentByte(after) {
 			return true
 		}
 		from = pos + 1
@@ -527,7 +527,7 @@ func renameCreateTableSQL(sql, newName string) (string, error) {
 			return false
 		}
 		end := i + len(kw)
-		if end < n && isIdentByte(sql[end]) {
+		if end < n && sqlident.IsIdentByte(sql[end]) {
 			return false
 		}
 		i = end
@@ -590,7 +590,7 @@ func scanIdentifier(s string, i int) (int, error) {
 		return i + j + 1, nil
 	default:
 		j := i
-		for j < len(s) && isIdentByte(s[j]) {
+		for j < len(s) && sqlident.IsIdentByte(s[j]) {
 			j++
 		}
 		if j == i {
@@ -602,14 +602,4 @@ func scanIdentifier(s string, i int) (int, error) {
 
 func isSpaceByte(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
-}
-
-// isIdentByte reports whether c can appear inside a bare (unquoted) SQL
-// identifier. SQLite's tokenizer treats every byte with the high bit set
-// (part of a multi-byte UTF-8 sequence, or any raw byte >= 0x80) as an
-// identifier byte, not just ASCII letters/digits/underscore — and, found by
-// Phase 8 fuzzing, '$' too (verified directly: CREATE TABLE "foo$bar" is
-// accepted with foo$bar unquoted, storing that literal table name).
-func isIdentByte(c byte) bool {
-	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80
 }
