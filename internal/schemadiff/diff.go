@@ -1,4 +1,361 @@
 package schemadiff
 
+import (
+	"sort"
+	"strings"
+)
+
+// SchemaDiff is the set of table/column/index/foreign-key differences
+// between two structured schemas produced by Parse.
+type SchemaDiff struct {
+	AddedTables   []*Table
+	RemovedTables []*Table
+	ChangedTables []TableDiff
+}
+
+// Empty reports whether the two schemas were identical.
+func (d *SchemaDiff) Empty() bool {
+	return len(d.AddedTables) == 0 && len(d.RemovedTables) == 0 && len(d.ChangedTables) == 0
+}
+
+// TableDiff is what changed about one table that exists in both schemas.
+type TableDiff struct {
+	Name   string
+	Before *Table
+	After  *Table
+
+	AddedColumns   []Column
+	RemovedColumns []Column
+	ChangedColumns []ColumnDiff
+
+	AddedForeignKeys   []ForeignKey
+	RemovedForeignKeys []ForeignKey
+
+	AddedIndexes   []Index
+	RemovedIndexes []Index
+
+	// SQLChanged is true when the table's own CREATE TABLE text differs
+	// even though nothing else tracked above does — the only signal
+	// available for constructs PRAGMA introspection doesn't expose at
+	// all (CHECK constraints, COLLATE, GENERATED ALWAYS AS). It is never
+	// consulted for safe/destructive classification, only to detect that
+	// a rebuild-worthy change happened.
+	SQLChanged bool
+}
+
+// Empty reports whether this table has no detected differences at all.
+func (td *TableDiff) Empty() bool {
+	return len(td.AddedColumns) == 0 && len(td.RemovedColumns) == 0 && len(td.ChangedColumns) == 0 &&
+		len(td.AddedForeignKeys) == 0 && len(td.RemovedForeignKeys) == 0 &&
+		len(td.AddedIndexes) == 0 && len(td.RemovedIndexes) == 0 &&
+		!td.SQLChanged
+}
+
+// ColumnDiff is a column present in both schemas whose definition changed.
+type ColumnDiff struct {
+	Name   string
+	Before Column
+	After  Column
+}
+
 // Diff compares two structured schemas produced by Parse and returns the
-// set of table/column/index/trigger/view differences between them.
+// set of table/column/index/foreign-key differences between them. Table
+// identity is matched ASCII-case-insensitively, as SQLite itself treats
+// identifiers: a table or column that only changed case is neither added
+// nor removed.
+func Diff(before, after *Schema) *SchemaDiff {
+	d := &SchemaDiff{}
+
+	beforeByKey := make(map[string]*Table, len(before.Tables))
+	for _, t := range before.Tables {
+		beforeByKey[asciiLower(t.Name)] = t
+	}
+	afterByKey := make(map[string]*Table, len(after.Tables))
+	for _, t := range after.Tables {
+		afterByKey[asciiLower(t.Name)] = t
+	}
+
+	for _, name := range after.SortedTableNames() {
+		if _, ok := beforeByKey[asciiLower(name)]; !ok {
+			d.AddedTables = append(d.AddedTables, after.Tables[name])
+		}
+	}
+	for _, name := range before.SortedTableNames() {
+		if _, ok := afterByKey[asciiLower(name)]; !ok {
+			d.RemovedTables = append(d.RemovedTables, before.Tables[name])
+		}
+	}
+
+	for _, name := range before.SortedTableNames() {
+		beforeTable := before.Tables[name]
+		afterTable, ok := afterByKey[asciiLower(name)]
+		if !ok {
+			continue
+		}
+
+		td := diffTable(beforeTable, afterTable)
+		if !td.Empty() {
+			d.ChangedTables = append(d.ChangedTables, td)
+		}
+	}
+
+	return d
+}
+
+func diffTable(before, after *Table) TableDiff {
+	td := TableDiff{Name: before.Name, Before: before, After: after}
+
+	afterCols := make(map[string]Column, len(after.Columns))
+	for _, c := range after.Columns {
+		afterCols[asciiLower(c.Name)] = c
+	}
+	beforeCols := make(map[string]Column, len(before.Columns))
+	for _, c := range before.Columns {
+		beforeCols[asciiLower(c.Name)] = c
+	}
+
+	for _, c := range after.Columns {
+		beforeCol, ok := beforeCols[asciiLower(c.Name)]
+		if !ok {
+			td.AddedColumns = append(td.AddedColumns, c)
+			continue
+		}
+		if !columnsEqual(beforeCol, c) {
+			td.ChangedColumns = append(td.ChangedColumns, ColumnDiff{Name: c.Name, Before: beforeCol, After: c})
+		}
+	}
+	for _, c := range before.Columns {
+		if _, ok := afterCols[asciiLower(c.Name)]; !ok {
+			td.RemovedColumns = append(td.RemovedColumns, c)
+		}
+	}
+
+	td.AddedForeignKeys, td.RemovedForeignKeys = diffForeignKeys(before.ForeignKeys, after.ForeignKeys)
+	td.AddedIndexes, td.RemovedIndexes = diffIndexes(before.Indexes, after.Indexes)
+
+	td.SQLChanged = normalizeSQL(before.SQL) != normalizeSQL(after.SQL)
+
+	return td
+}
+
+func columnsEqual(a, b Column) bool {
+	return a.Type == b.Type &&
+		a.NotNull == b.NotNull &&
+		a.HasDefault == b.HasDefault &&
+		a.DefaultValue == b.DefaultValue &&
+		a.PrimaryKeySeq == b.PrimaryKeySeq
+}
+
+func diffForeignKeys(before, after []ForeignKey) (added, removed []ForeignKey) {
+	// Table, From and To are folded to lower case for the identity key only
+	// — a foreign key whose target table or column only changed case is
+	// not a different key, matching how Diff matches table/column names.
+	key := func(fk ForeignKey) ForeignKey {
+		fk.Table = asciiLower(fk.Table)
+		fk.From = asciiLower(fk.From)
+		fk.To = asciiLower(fk.To)
+		return fk
+	}
+
+	beforeSet := make(map[ForeignKey]bool, len(before))
+	for _, fk := range before {
+		beforeSet[key(fk)] = true
+	}
+	afterSet := make(map[ForeignKey]bool, len(after))
+	for _, fk := range after {
+		afterSet[key(fk)] = true
+	}
+
+	for _, fk := range after {
+		if !beforeSet[key(fk)] {
+			added = append(added, fk)
+		}
+	}
+	for _, fk := range before {
+		if !afterSet[key(fk)] {
+			removed = append(removed, fk)
+		}
+	}
+	return added, removed
+}
+
+func diffIndexes(before, after []Index) (added, removed []Index) {
+	// Comparing sqlite_master.sql (normalized) catches everything the
+	// column list and origin/unique flags miss on their own: a changed
+	// partial-index WHERE clause, DESC/COLLATE on a column, or a change
+	// inside an indexed expression pragma_index_info can't name at all.
+	key := func(idx Index) string {
+		cols := make([]string, len(idx.Columns))
+		for i, c := range idx.Columns {
+			cols[i] = asciiLower(c)
+		}
+		return asciiLower(idx.Name) + "\x00" + idx.Origin + "\x00" + boolStr(idx.Unique) + "\x00" +
+			strings.Join(cols, ",") + "\x00" + normalizeSQL(idx.SQL)
+	}
+
+	beforeSet := make(map[string]bool, len(before))
+	for _, idx := range before {
+		beforeSet[key(idx)] = true
+	}
+	afterSet := make(map[string]bool, len(after))
+	for _, idx := range after {
+		afterSet[key(idx)] = true
+	}
+
+	for _, idx := range after {
+		if !beforeSet[key(idx)] {
+			added = append(added, idx)
+		}
+	}
+	for _, idx := range before {
+		if !afterSet[key(idx)] {
+			removed = append(removed, idx)
+		}
+	}
+
+	sort.Slice(added, func(i, j int) bool { return added[i].Name < added[j].Name })
+	sort.Slice(removed, func(i, j int) bool { return removed[i].Name < removed[j].Name })
+
+	return added, removed
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+// asciiLower folds ASCII letters to lower case, matching SQLite's own
+// case-insensitive identifier comparison (which never applies Unicode
+// case-folding rules).
+func asciiLower(s string) string {
+	b := []byte(s)
+	changed := false
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+			changed = true
+		}
+	}
+	if !changed {
+		return s
+	}
+	return string(b)
+}
+
+// normalizeSQL reduces a CREATE TABLE/INDEX statement, as SQLite echoes it
+// back verbatim from the source text, to a token stream so that keyword
+// case, comments, identifier-quoting style and the comma/whitespace
+// placement ALTER TABLE ADD COLUMN introduces when splicing a new column
+// definition into stored SQL don't register as a change. String literal
+// contents are preserved exactly, so a genuine change (a CHECK expression,
+// a COLLATE clause, a GENERATED ALWAYS AS expression, and so on) still
+// compares unequal.
+func normalizeSQL(sql string) string {
+	return strings.Join(sqlTokens(sql), " ")
+}
+
+// sqlTokens tokenizes SQL source text: whitespace is discarded, comments
+// are stripped, string literals are kept verbatim (including their
+// quotes), the backtick- and bracket-quoted identifier forms are unwrapped
+// to their bare, lower-cased name, and every other run of identifier
+// characters is lower-cased. A double-quoted token is unwrapped but its
+// case is kept exactly as written: SQLite's double-quoted string (DQS)
+// fallback treats "…" as a string literal whenever it doesn't name a
+// column, and normalizeSQL has no schema to tell the two cases apart, so
+// folding its case could silently normalize away a genuine change to a
+// CHECK constraint or similar. Everything else (punctuation, operators)
+// becomes a single-character token, so that a change in the whitespace
+// around it never affects the token stream.
+func sqlTokens(s string) []string {
+	var tokens []string
+	n := len(s)
+	for i := 0; i < n; {
+		c := s[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f':
+			i++
+		case c == '-' && i+1 < n && s[i+1] == '-':
+			j := strings.IndexByte(s[i:], '\n')
+			if j < 0 {
+				i = n
+			} else {
+				i += j
+			}
+		case c == '/' && i+1 < n && s[i+1] == '*':
+			j := strings.Index(s[i+2:], "*/")
+			if j < 0 {
+				i = n
+			} else {
+				i += j + 4
+			}
+		case c == '\'':
+			j := scanQuoted(s, i, '\'')
+			tokens = append(tokens, s[i:j])
+			i = j
+		case c == '"':
+			j := scanQuoted(s, i, c)
+			tokens = append(tokens, unquote(s[i:j], c))
+			i = j
+		case c == '`':
+			j := scanQuoted(s, i, c)
+			tokens = append(tokens, asciiLower(unquote(s[i:j], c)))
+			i = j
+		case c == '[':
+			j := strings.IndexByte(s[i:], ']')
+			if j < 0 {
+				tokens = append(tokens, asciiLower(s[i+1:]))
+				i = n
+			} else {
+				tokens = append(tokens, asciiLower(s[i+1:i+j]))
+				i += j + 1
+			}
+		case isIdentByte(c):
+			j := i + 1
+			for j < n && isIdentByte(s[j]) {
+				j++
+			}
+			tokens = append(tokens, asciiLower(s[i:j]))
+			i = j
+		default:
+			tokens = append(tokens, string(c))
+			i++
+		}
+	}
+	return tokens
+}
+
+// scanQuoted returns the index just past the end of a quoted run starting
+// at s[start] (which holds the opening quote char), honoring the SQL
+// convention that a doubled quote char is an escaped literal quote inside
+// the run rather than its terminator.
+func scanQuoted(s string, start int, quote byte) int {
+	n := len(s)
+	j := start + 1
+	for j < n {
+		if s[j] == quote {
+			if j+1 < n && s[j+1] == quote {
+				j += 2
+				continue
+			}
+			return j + 1
+		}
+		j++
+	}
+	return n
+}
+
+// unquote strips a quoted run's opening/closing quote chars and collapses
+// any doubled quote char inside it back to one.
+func unquote(s string, quote byte) string {
+	inner := s
+	if len(inner) >= 2 && inner[0] == quote && inner[len(inner)-1] == quote {
+		inner = inner[1 : len(inner)-1]
+	}
+	return strings.ReplaceAll(inner, string(quote)+string(quote), string(quote))
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
