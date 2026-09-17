@@ -1,0 +1,105 @@
+name: Bug report
+description: Something in sqlite-migrate doesn't work the way it should.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please include enough detail for someone
+        who has never seen this to reproduce it — exact commands and exact
+        output beat a description of what happened.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What's broken, in a sentence or two.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: >-
+        The exact commands and/or `schema.sql` that trigger it. A runnable
+        snippet is worth far more than a description.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exact error text or output, not a paraphrase.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: sqlite-migrate version / commit
+      placeholder: v0.1.0, or a commit SHA if built from source
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "go version output, OS/arch (e.g. go1.23.2 darwin/arm64)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area (best guess)
+      description: Helps triage route this — pick "Not sure" if you don't know.
+      options:
+        - "schemadiff — internal/schemadiff/"
+        - "rebuild — internal/rebuild/"
+        - "rename — internal/rename/"
+        - "sqldefwrap — internal/sqldefwrap/"
+        - "runtime — migration.go, runner.go, snapshot.go, drift.go, checksum.go"
+        - "cli — cmd/sqlite-migrate/"
+        - "docs — README.md, docs/"
+        - "ci — .github/workflows/, Makefile"
+        - "skill — skills/sqlite-migrate/"
+        - "Not sure"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: data_loss
+    attributes:
+      label: Data-loss / destructive-path risk?
+      description: >-
+        Does this touch the destructive-vs-safe classifier, the rebuild
+        generator, the backup/restore (`VACUUM INTO`) path, checksum
+        verification, or the replay-based drift check — anywhere a bug could
+        silently lose or corrupt a database?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else worth knowing — logs, related issues, workarounds tried.
+    validations:
+      required: false
