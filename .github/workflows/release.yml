@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          out=sqlite-migrate
+          if [ "$GOOS" = "windows" ]; then out=sqlite-migrate.exe; fi
+          go build -o "$out" ./cmd/sqlite-migrate
+          archive="sqlite-migrate_${{ github.ref_name }}_${GOOS}_${GOARCH}"
+          if [ "$GOOS" = "windows" ]; then
+            zip "${archive}.zip" "$out"
+            echo "ASSET=${archive}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${archive}.tar.gz" "$out"
+            echo "ASSET=${archive}.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
