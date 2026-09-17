@@ -15,7 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -33,38 +33,62 @@ type SnapshotWarning struct {
 func (e *SnapshotWarning) Error() string { return e.Err.Error() }
 func (e *SnapshotWarning) Unwrap() error { return e.Err }
 
+// snapshotTimestampLayout parses the one-second-resolution timestamp used by
+// snapshot files created under the previous naming scheme
+// ("<dbfile>.<ts>.snapshot" or "<dbfile>.<ts>-<attempt>.snapshot"). New
+// snapshot names no longer use it; it exists only so pruneSnapshots keeps
+// ordering those older files correctly after an upgrade.
 const snapshotTimestampLayout = "20060102150405"
 
 // maxSnapshotNameAttempts bounds the retry loop reserveSnapshotName uses to
-// find a filename nothing else has already claimed. One-second timestamp
-// resolution means two Snapshot calls within the same second need a second
-// attempt; this bound only exists to turn a pathological run of collisions
-// into an error rather than an infinite loop.
+// find a filename nothing else has already claimed. Names are built from a
+// strictly increasing nanosecond timestamp (see nextSnapshotTimestamp), so a
+// collision should never happen; this bound only exists to turn a
+// pathological run of collisions — e.g. another process reserving the exact
+// same name at the exact same nanosecond — into an error rather than an
+// infinite loop.
 const maxSnapshotNameAttempts = 10000
 
-// snapshotName builds the final (non-temporary) snapshot filename for dbFile
-// taken at ts: "<dbfile>.<timestamp>.snapshot", or
-// "<dbfile>.<timestamp>-<attempt>.snapshot" for attempt > 0, used when the
-// unsuffixed name is already taken.
-func snapshotName(dbFile string, ts time.Time, attempt int) string {
-	stamp := ts.UTC().Format(snapshotTimestampLayout)
-	if attempt == 0 {
-		return fmt.Sprintf("%s.%s.snapshot", filepath.Base(dbFile), stamp)
+var (
+	snapshotClockMu   sync.Mutex
+	snapshotClockLast int64
+)
+
+// nextSnapshotTimestamp returns a nanosecond timestamp that is always
+// strictly greater than every value it has previously returned in this
+// process, even when two calls land on the same wall-clock instant or the
+// clock's resolution can't otherwise distinguish them. This is what makes
+// snapshot names collision-free by construction instead of by retrying
+// under an attempt suffix.
+func nextSnapshotTimestamp() int64 {
+	snapshotClockMu.Lock()
+	defer snapshotClockMu.Unlock()
+	now := time.Now().UnixNano()
+	if now <= snapshotClockLast {
+		now = snapshotClockLast + 1
 	}
-	return fmt.Sprintf("%s.%s-%d.snapshot", filepath.Base(dbFile), stamp, attempt)
+	snapshotClockLast = now
+	return now
+}
+
+// snapshotName builds the final (non-temporary) snapshot filename for dbFile
+// from a strictly increasing nanosecond timestamp (see
+// nextSnapshotTimestamp): "<dbfile>.<20-digit nanoseconds>.snapshot". The
+// fixed-width, zero-padded digits keep names lexicographically sortable by
+// construction, so no attempt suffix is ever needed to keep them ordered.
+func snapshotName(dbFile string, ns int64) string {
+	return fmt.Sprintf("%s.%020d.snapshot", filepath.Base(dbFile), ns)
 }
 
 // reserveSnapshotName atomically claims a snapshot filename inside dir that
 // nothing else has already claimed, by creating it exclusively (O_EXCL) —
-// so two Snapshot calls landing in the same second, or any other name
-// collision, retry under a new name instead of one silently overwriting the
-// other's backup once VACUUM INTO finishes. The safety model calls the
-// pre-apply snapshot "the actual undo mechanism"; it must never be
+// so a name collision retries under a new name instead of one silently
+// overwriting another backup once VACUUM INTO finishes. The safety model
+// calls the pre-apply snapshot "the actual undo mechanism"; it must never be
 // destroyed by a later snapshot.
 func reserveSnapshotName(dir, dbPath string) (string, error) {
-	now := time.Now()
 	for attempt := 0; attempt < maxSnapshotNameAttempts; attempt++ {
-		candidate := filepath.Join(dir, snapshotName(dbPath, now, attempt))
+		candidate := filepath.Join(dir, snapshotName(dbPath, nextSnapshotTimestamp()))
 		f, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err == nil {
 			_ = f.Close()
@@ -178,12 +202,54 @@ func syncFile(path string) error {
 	return nil
 }
 
-// snapshotNamePattern parses a name built by snapshotName back into its
-// timestamp and attempt, so pruneSnapshots can order snapshots by age
-// numerically instead of lexicographically — a plain string sort puts
-// "...-10.snapshot" before "...-2.snapshot" once double-digit attempts
-// appear.
-var snapshotNamePattern = regexp.MustCompile(`\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+// newSnapshotNamePattern matches names built by the current snapshotName for
+// dbFile: a fixed-width, zero-padded nanosecond timestamp with no attempt
+// suffix. Anchored on dbFile's exact base name, not just checked as a
+// prefix — a bare prefix test would let pruning for "app" match and delete
+// "app.db"'s snapshots whenever the two share a SnapshotDir.
+func newSnapshotNamePattern(dbFile string) *regexp.Regexp {
+	return regexp.MustCompile(`^` + regexp.QuoteMeta(filepath.Base(dbFile)) + `\.([0-9]{20})\.snapshot$`)
+}
+
+// oldSnapshotNamePattern matches names built by the one-second-resolution
+// scheme this replaces, with its optional numeric attempt suffix
+// ("...-10.snapshot" vs "...-2.snapshot") — still present on disk in any
+// directory that has snapshots from before an upgrade. Anchored the same
+// way as newSnapshotNamePattern, for the same reason.
+func oldSnapshotNamePattern(dbFile string) *regexp.Regexp {
+	return regexp.MustCompile(`^` + regexp.QuoteMeta(filepath.Base(dbFile)) + `\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+}
+
+// snapshotFileAge parses name against newPattern/oldPattern (dbFile's own
+// patterns from newSnapshotNamePattern/oldSnapshotNamePattern) into a
+// nanosecond value usable only to order snapshots relative to each other,
+// not as a real timestamp: an old-format name's attempt suffix (bounded
+// well under a second's worth of nanoseconds) is folded in as a sub-second
+// tiebreaker so files from the same one-second bucket still sort in the
+// order they were reserved. A name that doesn't belong to dbFile at all —
+// including another database's, in a shared SnapshotDir — matches neither
+// pattern.
+func snapshotFileAge(newPattern, oldPattern *regexp.Regexp, name string) (int64, bool) {
+	if m := newPattern.FindStringSubmatch(name); m != nil {
+		ns, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return ns, true
+	}
+	if m := oldPattern.FindStringSubmatch(name); m != nil {
+		t, err := time.Parse(snapshotTimestampLayout, m[1])
+		if err != nil {
+			return 0, false
+		}
+		attempt := 0
+		if m[2] != "" {
+			attempt, _ = strconv.Atoi(m[2])
+		}
+		return t.UnixNano() + int64(attempt), true
+	}
+	return 0, false
+}
 
 // pruneSnapshots removes the oldest snapshot files for dbPath in dir until
 // at most retain remain. retain <= 0 disables pruning: every snapshot is
@@ -193,39 +259,33 @@ func pruneSnapshots(dbPath, dir string, retain int) error {
 		return nil
 	}
 
-	prefix := filepath.Base(dbPath) + "."
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("sqlitemigrate: list snapshot directory %q: %w", dir, err)
 	}
 
+	newPattern := newSnapshotNamePattern(dbPath)
+	oldPattern := oldSnapshotNamePattern(dbPath)
+
 	type snapshotFile struct {
-		name    string
-		stamp   string
-		attempt int
+		name string
+		age  int64
 	}
 
 	var files []snapshotFile
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".snapshot") {
+		if e.IsDir() {
 			continue
 		}
-		m := snapshotNamePattern.FindStringSubmatch(name)
-		if m == nil {
+		age, ok := snapshotFileAge(newPattern, oldPattern, name)
+		if !ok {
 			continue
 		}
-		attempt := 0
-		if m[2] != "" {
-			attempt, _ = strconv.Atoi(m[2])
-		}
-		files = append(files, snapshotFile{name: name, stamp: m[1], attempt: attempt})
+		files = append(files, snapshotFile{name: name, age: age})
 	}
 	sort.Slice(files, func(i, j int) bool {
-		if files[i].stamp != files[j].stamp {
-			return files[i].stamp < files[j].stamp
-		}
-		return files[i].attempt < files[j].attempt
+		return files[i].age < files[j].age
 	})
 
 	if len(files) <= retain {
