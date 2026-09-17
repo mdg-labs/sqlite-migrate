@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,8 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+var update = flag.Bool("update", false, "update golden files")
 
 func fixedNow() time.Time {
 	return time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
@@ -314,30 +317,6 @@ func TestGenerate_RenameDeclinedFallsBackToDestructive(t *testing.T) {
 	}
 }
 
-// TestGenerate_NotStrictRefused covers scenario 17: a schema.sql table
-// missing STRICT is refused with a clear error, and nothing is written.
-func TestGenerate_NotStrictRefused(t *testing.T) {
-	dir, schemaPath, migrationsDir := newProject(t)
-	opts := baseOptions(schemaPath, migrationsDir)
-
-	writeSchema(t, schemaPath, `CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    name TEXT
-);`)
-
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err == nil {
-		t.Fatalf("expected refusal for a non-STRICT table")
-	} else if !strings.Contains(err.Error(), "STRICT") {
-		t.Fatalf("expected the error to mention STRICT, got: %v", err)
-	}
-
-	entries, err := os.ReadDir(migrationsDir)
-	if err == nil && len(entries) != 0 {
-		t.Fatalf("expected no migration files to be written, found %v", entries)
-	}
-	_ = dir
-}
-
 // TestGenerate_NoChanges covers an unchanged schema.sql: nothing is
 // written and no error is returned.
 func TestGenerate_NoChanges(t *testing.T) {
@@ -356,39 +335,6 @@ func TestGenerate_NoChanges(t *testing.T) {
 	if res.written {
 		t.Fatalf("expected nothing to be written for an unchanged schema")
 	}
-}
-
-// TestGenerate_ReferencesWithNonNullDefault covers scenario 05: SQLite
-// only refuses a REFERENCES column with a non-NULL default once the table
-// already holds rows and foreign_keys enforcement is on — a state a
-// schema-only replay never reaches, and one Runner.Apply (Phase 5) never
-// reaches either, since it suspends foreign_keys for the whole migration
-// transaction. generate has no live data to check against (by design —
-// see "Constraint tightening failing loudly at apply time" in the spec
-// doc), so it hands back the same valid-looking statement sqldefwrap
-// already produces; SQLite is the one that would refuse it, at the point
-// real data and enforcement coincide.
-func TestGenerate_ReferencesWithNonNullDefault(t *testing.T) {
-	_, schemaPath, migrationsDir := newProject(t)
-	opts := baseOptions(schemaPath, migrationsDir)
-
-	writeSchema(t, schemaPath, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
-CREATE TABLE orders (id INTEGER PRIMARY KEY) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
-		t.Fatalf("initial generate: %v", err)
-	}
-
-	writeSchema(t, schemaPath, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
-CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0 REFERENCES users(id)) STRICT;`)
-
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
-	if err != nil {
-		t.Fatalf("generate: %v", err)
-	}
-	if !res.written {
-		t.Fatalf("expected the migration to be written")
-	}
-	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
 }
 
 // TestGenerate_TestdataScenarios runs every rebuild-flavored testdata
@@ -569,5 +515,137 @@ func TestGenerate_ConflictingAssumeRenameFlags(t *testing.T) {
 	_, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
 	if !errors.Is(err, rename.ErrConflictingAssumeFlags) {
 		t.Fatalf("expected ErrConflictingAssumeFlags, got: %v", err)
+	}
+}
+
+// goldenAssumeRenames names the scenarios whose expected outcome (matrix
+// rows 14/15: "prompts; on confirm, RENAME COLUMN"/"RENAME TO") needs
+// --assume-renames to reach that confirmed-rename branch non-interactively.
+var goldenAssumeRenames = map[string]bool{
+	"14_column_renamed": true,
+	"15_table_renamed":  true,
+}
+
+// goldenRefused names the scenarios whose expected outcome per the spec
+// doc's scenario matrix is generate refusing outright (12/13: destructive
+// without --allow-destructive; 17: STRICT missing) — for these, the
+// "golden" file under testdata/golden/generate records the exact expected
+// error message rather than SQL.
+//
+// Scenario 05 (REFERENCES + non-NULL default) is deliberately absent from
+// this map even though the matrix once listed it as "refused outright":
+// SQLite only rejects that combination once the table already holds rows
+// and foreign_keys enforcement is on, a state neither this schema-only
+// replay nor Runner.Apply (which suspends foreign_keys for the whole
+// migration transaction) ever reaches, so generate hands back the same
+// valid-looking ADD COLUMN statement sqldefwrap produces for any other
+// added column.
+var goldenRefused = map[string]bool{
+	"12_column_dropped":     true,
+	"13_table_dropped":      true,
+	"17_not_strict_refused": true,
+}
+
+// TestGolden runs generate's full pipeline against every scenario fixture
+// under testdata/schemas/generate — the direct/destructive/rename/STRICT-
+// refusal scenarios from the spec doc's scenario matrix that the generate
+// command itself routes (01-06, 12-15, 17), as opposed to the matrix's
+// full-rebuild scenarios (07-11, 16, 18) directly under testdata/schemas,
+// which are internal/rebuild's own golden-file scenarios and stay under
+// its own TestGolden. Each fixture's expected outcome is recorded
+// byte-for-byte in testdata/golden/generate/<name>.sql: the generated
+// migration body for a scenario generate is expected to write, or the
+// exact refusal error message for one it's expected to refuse.
+func TestGolden(t *testing.T) {
+	dirs, err := filepath.Glob("../../testdata/schemas/generate/*")
+	if err != nil {
+		t.Fatalf("glob scenario dirs: %v", err)
+	}
+	found := 0
+	for _, scenarioDir := range dirs {
+		beforePath := filepath.Join(scenarioDir, "before.sql")
+		if _, err := os.Stat(beforePath); err != nil {
+			continue // e.g. testdata/schemas/generate/.gitkeep, not a scenario directory
+		}
+		found++
+		name := filepath.Base(scenarioDir)
+		t.Run(name, func(t *testing.T) {
+			before := readFileString(t, beforePath)
+			after := readFileString(t, filepath.Join(scenarioDir, "after.sql"))
+
+			_, schemaPath, migrationsDir := newProject(t)
+			if strings.TrimSpace(before) != "" {
+				if err := os.MkdirAll(migrationsDir, 0o755); err != nil {
+					t.Fatalf("mkdir migrations: %v", err)
+				}
+				seedPath := filepath.Join(migrationsDir, "20260101000000_seed.sql")
+				if err := os.WriteFile(seedPath, []byte(before), 0o644); err != nil {
+					t.Fatalf("seed migration: %v", err)
+				}
+			}
+			writeSchema(t, schemaPath, after)
+
+			opts := baseOptions(schemaPath, migrationsDir)
+			opts.assumeRenames = goldenAssumeRenames[name]
+
+			entriesBefore, err := os.ReadDir(migrationsDir)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("read migrations dir: %v", err)
+			}
+
+			goldenPath := filepath.Join("..", "..", "testdata", "golden", "generate", name+".sql")
+			res, genErr := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+
+			if goldenRefused[name] {
+				if genErr == nil {
+					t.Fatalf("expected generate to refuse scenario %s", name)
+				}
+				entriesAfter, err := os.ReadDir(migrationsDir)
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatalf("read migrations dir: %v", err)
+				}
+				if len(entriesAfter) != len(entriesBefore) {
+					t.Fatalf("expected no migration file to be written on refusal, found %v", entriesAfter)
+				}
+				// The parse-failure error (scenario 17) embeds schemaPath, an
+				// absolute t.TempDir() path unique to this run — normalize it
+				// to a stable placeholder before recording/comparing.
+				msg := strings.ReplaceAll(genErr.Error(), schemaPath, "schema.sql")
+				compareOrUpdateGolden(t, goldenPath, msg+"\n")
+				return
+			}
+
+			if genErr != nil {
+				t.Fatalf("generate: %v", genErr)
+			}
+			if !res.written {
+				t.Fatalf("expected a migration to be written")
+			}
+			assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+
+			body := checksumHeaderPattern.ReplaceAllString(readFileString(t, res.path), "")
+			compareOrUpdateGolden(t, goldenPath, body)
+		})
+	}
+	if found == 0 {
+		t.Fatal("no scenario directories found under testdata/schemas/generate")
+	}
+}
+
+func compareOrUpdateGolden(t *testing.T, path, got string) {
+	t.Helper()
+	if *update {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden file: %v", err)
+		}
+		return
+	}
+
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (run `make golden-update` first)", path, err)
+	}
+	if got != string(want) {
+		t.Errorf("generate output doesn't match golden file %s\n--- got ---\n%s\n--- want ---\n%s", path, got, string(want))
 	}
 }

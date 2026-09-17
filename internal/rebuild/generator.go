@@ -471,7 +471,17 @@ func skipQuoted(s string, i int, q byte) int {
 // containsIdentifierWord reports whether lowerNeedle occurs in
 // lowerHaystack at an identifier word boundary — not as part of a longer
 // identifier on either side. Both arguments must already be lower-cased.
+// lowerNeedle == "" always reports false: found by Phase 8 fuzzing, an
+// empty needle matches at every position (per strings.Index's own
+// contract), which grew from without bound and eventually panicked on an
+// out-of-range slice — and a bare, unquoted identifier can never be empty
+// in real SQL syntax anyway (SQLite only allows an empty name quoted, e.g.
+// CREATE TABLE "" (...), which referencesTable's quotedForms check already
+// covers on its own).
 func containsIdentifierWord(lowerHaystack, lowerNeedle string) bool {
+	if lowerNeedle == "" {
+		return false
+	}
 	from := 0
 	for {
 		i := strings.Index(lowerHaystack[from:], lowerNeedle)
@@ -597,7 +607,9 @@ func isSpaceByte(c byte) bool {
 // isIdentByte reports whether c can appear inside a bare (unquoted) SQL
 // identifier. SQLite's tokenizer treats every byte with the high bit set
 // (part of a multi-byte UTF-8 sequence, or any raw byte >= 0x80) as an
-// identifier byte, not just ASCII letters/digits/underscore.
+// identifier byte, not just ASCII letters/digits/underscore — and, found by
+// Phase 8 fuzzing, '$' too (verified directly: CREATE TABLE "foo$bar" is
+// accepted with foo$bar unquoted, storing that literal table name).
 func isIdentByte(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80
 }

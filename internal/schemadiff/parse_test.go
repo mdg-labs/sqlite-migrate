@@ -86,6 +86,18 @@ func TestParse_InvalidSQL(t *testing.T) {
 	}
 }
 
+// TestParse_RejectsSchemaContainingNULByte reproduces a bug found by Phase
+// 8 fuzzing: modernc.org/sqlite silently stops executing a query string at
+// its first NUL byte and reports no error at all (verified directly), so
+// without this guard a schema.sql containing one would have every table
+// declared after it vanish from the parsed Schema without a trace.
+func TestParse_RejectsSchemaContainingNULByte(t *testing.T) {
+	_, err := Parse(context.Background(), "CREATE TABLE a (id INTEGER) STRICT;\x00CREATE TABLE b (id INTEGER) STRICT;")
+	if err == nil {
+		t.Fatal("want error for a schema.sql containing a NUL byte, got nil")
+	}
+}
+
 func TestParse_WithoutRowID(t *testing.T) {
 	schema := mustParse(t, `CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT, WITHOUT ROWID;`)
 	kv, ok := schema.Tables["kv"]

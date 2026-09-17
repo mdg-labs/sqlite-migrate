@@ -1,0 +1,7 @@
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY
+) STRICT;
+
+CREATE TABLE purchases (
+    id INTEGER PRIMARY KEY
+) STRICT;

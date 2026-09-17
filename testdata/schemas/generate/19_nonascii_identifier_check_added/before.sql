@@ -1,0 +1,4 @@
+CREATE TABLE t (
+    id INTEGER PRIMARY KEY,
+    café INTEGER
+) STRICT;
