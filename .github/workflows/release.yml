@@ -20,7 +20,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
-  release:
+  build:
     needs: test
     runs-on: ubuntu-latest
     strategy:
@@ -59,8 +59,23 @@ jobs:
             tar -czf "${archive}.tar.gz" "$out"
             echo "ASSET=${archive}.tar.gz" >> "$GITHUB_ENV"
           fi
-      - name: Upload release asset
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-asset-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-asset-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: dist/*
           generate_release_notes: true
