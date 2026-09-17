@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -118,6 +119,113 @@ func TestSnapshot_ConsecutiveCallsNeverOverwritePreviousSnapshot(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("first snapshot has %d rows after a later Snapshot call, want 1 (it must still reflect state at the time it was taken, not the state at some later overwrite)", count)
+	}
+}
+
+func TestSnapshot_ConcurrentCallsAllSucceedWithDistinctNames(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "app.db")
+	snapshotDir := filepath.Join(dir, "snapshots")
+
+	db := openFileDB(t, dbPath)
+	if _, err := db.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT;`); err != nil {
+		t.Fatalf("seed database: %v", err)
+	}
+
+	// Fire many Snapshot calls at the same directory concurrently: with
+	// nanosecond-resolution, strictly increasing names, no two calls should
+	// ever need the O_EXCL retry loop to avoid colliding.
+	const n = 128
+	var wg sync.WaitGroup
+	paths := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			paths[i], errs[i] = Snapshot(ctx, dbPath, snapshotDir, 0)
+		}(i)
+	}
+	wg.Wait()
+
+	seen := make(map[string]bool, n)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Snapshot call %d failed: %v", i, err)
+		}
+		if seen[paths[i]] {
+			t.Fatalf("Snapshot call %d returned duplicate path %q", i, paths[i])
+		}
+		seen[paths[i]] = true
+		if !newSnapshotNamePattern.MatchString(filepath.Base(paths[i])) {
+			t.Errorf("Snapshot call %d returned name %q not in the collision-free nanosecond format; it must have needed the attempt-retry fallback", i, filepath.Base(paths[i]))
+		}
+	}
+
+	entries, err := os.ReadDir(snapshotDir)
+	if err != nil {
+		t.Fatalf("read snapshot dir: %v", err)
+	}
+	if len(entries) != n {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("snapshot dir has %d files after %d concurrent Snapshot calls, want %d: %v", len(entries), n, n, names)
+	}
+}
+
+func TestSnapshot_PrunesOldAndNewFormatSnapshotsTogether(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "app.db")
+
+	db := openFileDB(t, dbPath)
+	if _, err := db.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT;`); err != nil {
+		t.Fatalf("seed database: %v", err)
+	}
+
+	snapshotDir := filepath.Join(dir, "snapshots")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatalf("mkdir snapshot dir: %v", err)
+	}
+
+	// A directory upgraded from the previous naming scheme realistically
+	// holds a mix of old-format (one-second timestamp, optional numeric
+	// attempt suffix) and new-format (fixed-width nanosecond) names at once.
+	oldest := filepath.Join(snapshotDir, "app.db.20200101000000.snapshot")
+	middle := filepath.Join(snapshotDir, "app.db.20210101000000-3.snapshot")
+	for _, p := range []string{oldest, middle} {
+		if err := os.WriteFile(p, []byte("placeholder"), 0o644); err != nil {
+			t.Fatalf("seed snapshot file %q: %v", p, err)
+		}
+	}
+
+	newest, err := Snapshot(ctx, dbPath, snapshotDir, 2)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	entries, err := os.ReadDir(snapshotDir)
+	if err != nil {
+		t.Fatalf("read snapshot dir: %v", err)
+	}
+	if len(entries) != 2 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("snapshot dir has %d files after retention pruning, want 2: %v", len(entries), names)
+	}
+
+	if _, err := os.Stat(oldest); !os.IsNotExist(err) {
+		t.Errorf("oldest snapshot %q was not pruned", oldest)
+	}
+	for _, p := range []string{middle, newest} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("retained snapshot %q missing: %v", p, err)
+		}
 	}
 }
 
