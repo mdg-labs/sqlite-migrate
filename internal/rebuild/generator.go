@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/mdg-labs/sqlite-migrate/internal/schemadiff"
+	"github.com/mdg-labs/sqlite-migrate/internal/sqlident"
 )
 
 // Generate produces the SQL for rebuilding every table in diffs, given the
@@ -387,11 +388,9 @@ func asciiLower(s string) string {
 	return string(b)
 }
 
-// quoteIdent double-quote-wraps a SQL identifier, doubling any embedded
-// double quote, so an identifier from schema.sql is never string-concatenated
-// raw into generated SQL.
+// quoteIdent double-quote-wraps a SQL identifier; see internal/sqlident.QuoteIdent.
 func quoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	return sqlident.QuoteIdent(name)
 }
 
 // quoteLiteral single-quote-wraps a string for use as a SQL text literal
