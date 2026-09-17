@@ -120,6 +120,15 @@ func (e *NotStrictError) Error() string {
 // if any ordinary table isn't declared STRICT; a virtual table (e.g. FTS5,
 // R-Tree) is exempt, since SQLite never allows one to be declared STRICT.
 func Parse(ctx context.Context, schemaSQL string) (*Schema, error) {
+	// Found by Phase 8 fuzzing: modernc.org/sqlite silently stops executing
+	// at the first NUL byte in a query string and reports no error at all
+	// (verified directly), so a schema.sql containing one would have every
+	// table and column declared after it vanish from the parsed Schema
+	// without a trace — refusing outright is the only safe response.
+	if i := strings.IndexByte(schemaSQL, 0); i >= 0 {
+		return nil, fmt.Errorf("schemadiff: schema.sql contains a NUL byte at offset %d", i)
+	}
+
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("schemadiff: open temp database: %w", err)

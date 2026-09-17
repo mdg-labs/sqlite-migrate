@@ -66,6 +66,15 @@ type catalog struct {
 }
 
 func loadCatalog(ctx context.Context, schemaSQL string, tables []string) (catalog, error) {
+	// Found by Phase 8 fuzzing (see schemadiff.Parse's identical guard):
+	// modernc.org/sqlite silently stops executing at the first NUL byte in
+	// a query string with no error at all, which would drop every trigger,
+	// view, and column declared after it from this catalog without a
+	// trace.
+	if i := strings.IndexByte(schemaSQL, 0); i >= 0 {
+		return catalog{}, fmt.Errorf("rebuild: schema SQL contains a NUL byte at offset %d", i)
+	}
+
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return catalog{}, fmt.Errorf("rebuild: open catalog probe database: %w", err)

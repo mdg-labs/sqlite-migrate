@@ -1,0 +1,4 @@
+CREATE TABLE foo$bar (
+    id INTEGER PRIMARY KEY,
+    v INTEGER
+) STRICT;
