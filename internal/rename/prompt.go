@@ -94,11 +94,22 @@ type Resolution struct {
 // decision. All candidates share one bufio.Reader over in, so scripted or
 // piped input is consumed in order across the whole run.
 func Resolve(ctx context.Context, d *schemadiff.SchemaDiff, in io.Reader, out io.Writer, flags Flags) ([]Resolution, error) {
-	candidates := Detect(d)
+	return ResolveCandidates(ctx, Detect(d), bufio.NewReader(in), out, flags)
+}
+
+// ResolveCandidates runs Confirm for every candidate, in order, sharing the
+// given reader across every prompt. Unlike Resolve, the caller owns and
+// passes in the *bufio.Reader itself: wrapping the same underlying input in
+// a fresh bufio.Reader per call (as a second Resolve call over the same
+// io.Reader would) discards whatever bytes the first reader already
+// buffered but not consumed — exactly the hazard Confirm's own doc
+// describes for a single Resolve call, but across separate Detect passes
+// within the same run (e.g. a rename revealed only after an earlier one is
+// applied).
+func ResolveCandidates(ctx context.Context, candidates []Candidate, in *bufio.Reader, out io.Writer, flags Flags) ([]Resolution, error) {
 	resolutions := make([]Resolution, 0, len(candidates))
-	reader := bufio.NewReader(in)
 	for _, c := range candidates {
-		confirmed, err := Confirm(ctx, reader, out, c, flags)
+		confirmed, err := Confirm(ctx, in, out, c, flags)
 		if err != nil {
 			return nil, err
 		}

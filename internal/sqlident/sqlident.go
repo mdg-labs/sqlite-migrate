@@ -13,6 +13,13 @@ func IsIdentByte(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
+// QuoteIdent double-quote-wraps a SQL identifier, doubling any embedded
+// double quote, so an identifier from schema.sql is never string-concatenated
+// raw into generated SQL.
+func QuoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 // ScanQuoted returns the index just past the end of a quoted run starting
 // at s[start] (which holds the opening quote char), honoring the SQL
 // convention that a doubled quote char is an escaped literal quote inside
