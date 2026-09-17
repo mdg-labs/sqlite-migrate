@@ -148,7 +148,7 @@ func TestLoadCatalog(t *testing.T) {
 		END;
 		CREATE VIEW items_view AS SELECT id, price FROM items;
 	`
-	cat, err := loadCatalog(context.Background(), schemaSQL)
+	cat, err := loadCatalog(context.Background(), schemaSQL, nil)
 	if err != nil {
 		t.Fatalf("loadCatalog: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestAffectedObjects_TriggerNotAttachedToRebuiltTable(t *testing.T) {
 			UPDATE users SET age = age + 1 WHERE id = NEW.id;
 		END;
 	`
-	cat, err := loadCatalog(context.Background(), schemaSQL)
+	cat, err := loadCatalog(context.Background(), schemaSQL, nil)
 	if err != nil {
 		t.Fatalf("loadCatalog: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestAffectedObjects_ViewChain(t *testing.T) {
 		CREATE VIEW v1 AS SELECT id, price FROM items;
 		CREATE VIEW v2 AS SELECT id FROM v1;
 	`
-	cat, err := loadCatalog(context.Background(), schemaSQL)
+	cat, err := loadCatalog(context.Background(), schemaSQL, nil)
 	if err != nil {
 		t.Fatalf("loadCatalog: %v", err)
 	}
@@ -244,5 +244,30 @@ func TestAffectedObjects_ViewChain(t *testing.T) {
 	ordered := topoSortViews(aff.views)
 	if ordered[0].name != "v1" || ordered[1].name != "v2" {
 		t.Fatalf("want v1 recreated before v2, got %s then %s", ordered[0].name, ordered[1].name)
+	}
+}
+
+func TestHasRowidAlias(t *testing.T) {
+	cases := []struct {
+		ddl  string
+		want bool
+	}{
+		{`CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT) STRICT;`, true},
+		{`CREATE TABLE t (id integer primary key asc, x TEXT) STRICT;`, true},
+		{`CREATE TABLE t (id INTEGER PRIMARY KEY DESC, x TEXT) STRICT;`, false},
+		{`CREATE TABLE t (id INT PRIMARY KEY, x TEXT) STRICT;`, false},
+		{`CREATE TABLE t (id TEXT PRIMARY KEY, x TEXT) STRICT;`, false},
+		{`CREATE TABLE t (a INTEGER, b INTEGER, PRIMARY KEY (a, b)) STRICT;`, false},
+		{`CREATE TABLE t (x TEXT) STRICT;`, false},
+		{`CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT) STRICT, WITHOUT ROWID;`, false},
+	}
+	for _, tc := range cases {
+		s, err := schemadiff.Parse(context.Background(), tc.ddl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.ddl, err)
+		}
+		if got := hasRowidAlias(s.Tables["t"]); got != tc.want {
+			t.Errorf("hasRowidAlias(%q) = %v, want %v", tc.ddl, got, tc.want)
+		}
 	}
 }

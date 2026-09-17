@@ -44,16 +44,28 @@ type catalogObject struct {
 	sql     string
 }
 
-// catalog is every trigger and view defined in a schema, gathered by
-// replaying it into a temporary database — schemadiff.Schema doesn't carry
-// either (Phase 1's Parse never reads them back), so rebuild does its own
-// replay here rather than depending on a wider Phase 1 change.
+// tableColumn is one column as read back from pragma_table_xinfo, which —
+// unlike the pragma_table_info schemadiff.Column comes from — also lists
+// generated columns.
+type tableColumn struct {
+	name      string
+	generated bool
+}
+
+// catalog is every trigger and view defined in a schema, plus the full
+// column list of each requested table, gathered by replaying it into a
+// temporary database — schemadiff.Schema carries neither (Phase 1's Parse
+// never reads triggers or views back, and skips generated columns), so
+// rebuild does its own replay here rather than depending on a wider Phase 1
+// change. columns is keyed by asciiLower table name; a requested table the
+// schema doesn't define has no entry.
 type catalog struct {
 	triggers []catalogObject
 	views    []catalogObject
+	columns  map[string][]tableColumn
 }
 
-func loadCatalog(ctx context.Context, schemaSQL string) (catalog, error) {
+func loadCatalog(ctx context.Context, schemaSQL string, tables []string) (catalog, error) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return catalog{}, fmt.Errorf("rebuild: open catalog probe database: %w", err)
@@ -97,7 +109,43 @@ func loadCatalog(ctx context.Context, schemaSQL string) (catalog, error) {
 	if err := rows.Err(); err != nil {
 		return catalog{}, fmt.Errorf("rebuild: read trigger/view catalog: %w", err)
 	}
+
+	cat.columns = make(map[string][]tableColumn, len(tables))
+	for _, t := range tables {
+		cols, err := readXColumns(ctx, db, t)
+		if err != nil {
+			return catalog{}, err
+		}
+		if len(cols) > 0 {
+			cat.columns[asciiLower(t)] = cols
+		}
+	}
 	return cat, nil
+}
+
+func readXColumns(ctx context.Context, db *sql.DB, table string) ([]tableColumn, error) {
+	// hidden is 2 for a VIRTUAL and 3 for a STORED generated column; 1 marks
+	// a virtual table's hidden column, which a rebuilt ordinary table never has.
+	rows, err := db.QueryContext(ctx, `SELECT name, hidden FROM pragma_table_xinfo(?) ORDER BY cid`, table)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild: read columns for %q: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []tableColumn
+	for rows.Next() {
+		var c tableColumn
+		var hidden int
+		if err := rows.Scan(&c.name, &hidden); err != nil {
+			return nil, fmt.Errorf("rebuild: scan column row for %q: %w", table, err)
+		}
+		c.generated = hidden == 2 || hidden == 3
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rebuild: read columns for %q: %w", table, err)
+	}
+	return out, nil
 }
 
 // indexStatements returns the CREATE INDEX statements needed to restore
@@ -186,6 +234,26 @@ func affectedObjects(rebuiltTables []string, cat catalog) affected {
 		}
 	}
 	return out
+}
+
+// mergeAffected is the union of a and b, deduplicated by name: the drop
+// set has to cover what exists before the migration as well as what the
+// after schema defines, since both can reference a rebuilt table.
+func mergeAffected(a, b affected) affected {
+	merge := func(x, y []catalogObject) []catalogObject {
+		seen := make(map[string]bool, len(x)+len(y))
+		var out []catalogObject
+		for _, o := range append(append([]catalogObject{}, x...), y...) {
+			key := asciiLower(o.name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, o)
+		}
+		return out
+	}
+	return affected{views: merge(a.views, b.views), triggers: merge(a.triggers, b.triggers)}
 }
 
 // referencesAny reports whether sql names any identifier in names.

@@ -104,7 +104,7 @@ func TestGolden(t *testing.T) {
 				t.Fatalf("scenario %s: no table diffs selected for rebuild", name)
 			}
 
-			got, err := Generate(context.Background(), afterSQL, diffs)
+			got, err := Generate(context.Background(), beforeSQL, afterSQL, diffs)
 			if err != nil {
 				t.Fatalf("Generate: %v", err)
 			}
@@ -235,7 +235,7 @@ func TestExecute_07_TypeChangePreservesData(t *testing.T) {
 		INSERT INTO users (id, age) VALUES (2, '45');
 	`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestExecute_11_IndexTriggerViewStillWork(t *testing.T) {
 		INSERT INTO items (id, price) VALUES (2, '250');
 	`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestExecute_18_FKCyclePreservesDataAndOrdering(t *testing.T) {
 		t.Fatalf("want both a and b to need a rebuild, got %d diffs", len(diffs))
 	}
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestExecute_TriggerOnUnrebuiltTableReferencingRebuiltTableFires(t *testing.
 
 	db := openSeededDB(t, beforeSQL, `INSERT INTO users (id, age) VALUES (1, '30');`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -464,7 +464,7 @@ func TestExecute_ViewChainReferencingRebuiltTableStillWorks(t *testing.T) {
 
 	db := openSeededDB(t, beforeSQL, `INSERT INTO items (id, price) VALUES (1, '100');`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -511,7 +511,7 @@ func TestExecute_TriggerAcrossTwoRebuiltTablesSurvivesRename(t *testing.T) {
 		INSERT INTO c (id, p_id, val) VALUES (1, 1, '5');
 	`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -542,7 +542,7 @@ func TestExecute_NonASCIITableNameRebuilds(t *testing.T) {
 
 	db := openSeededDB(t, beforeSQL, `INSERT INTO bücher (id, v) VALUES (1, '42');`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -572,7 +572,7 @@ func TestExecute_AutoincrementSequenceNotReusedAfterRebuild(t *testing.T) {
 		DELETE FROM t WHERE id = 3;
 	`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestExecute_AutoincrementSequenceCarriedWhenRebuildLeavesTableEmpty(t *test
 		DELETE FROM t WHERE id IN (1, 2);
 	`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -644,7 +644,7 @@ func TestExecute_RebuildTableWithNonAutoincrementCommentSucceeds(t *testing.T) {
 
 	db := openSeededDB(t, beforeSQL, `INSERT INTO t (id, v) VALUES (1, '42');`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -670,7 +670,7 @@ func TestExecute_RebuildTableWithAutoincrementStringLiteralSucceeds(t *testing.T
 
 	db := openSeededDB(t, beforeSQL, `INSERT INTO t (id, mode, v) VALUES (1, 'manual', '42');`)
 
-	stmts, err := Statements(context.Background(), afterSQL, diffs)
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
 	if err != nil {
 		t.Fatalf("Statements: %v", err)
 	}
@@ -682,5 +682,151 @@ func TestExecute_RebuildTableWithAutoincrementStringLiteralSucceeds(t *testing.T
 	}
 	if v != 42 {
 		t.Errorf("want v = 42, got %d", v)
+	}
+}
+
+// TestExecute_ViewAndTriggerRemovedAlongsideRebuild covers a view and a
+// trigger that exist before the migration but not after it, both
+// referencing the rebuilt table: they must still be dropped before the
+// rename, or SQLite's rename-time schema recompile fails on them.
+func TestExecute_ViewAndTriggerRemovedAlongsideRebuild(t *testing.T) {
+	beforeSQL := `
+		CREATE TABLE users (id INTEGER PRIMARY KEY, age TEXT) STRICT;
+		CREATE TABLE log (id INTEGER PRIMARY KEY, note TEXT) STRICT;
+		CREATE VIEW users_view AS SELECT id, age FROM users;
+		CREATE TRIGGER trg_log_touch AFTER INSERT ON log
+		BEGIN
+			UPDATE users SET age = age WHERE id = NEW.id;
+		END;
+	`
+	afterSQL := `
+		CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER) STRICT;
+		CREATE TABLE log (id INTEGER PRIMARY KEY, note TEXT) STRICT;
+	`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "users")
+
+	db := openSeededDB(t, beforeSQL, `INSERT INTO users (id, age) VALUES (1, '30');`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name IN ('users_view', 'trg_log_touch')`).Scan(&n); err != nil {
+		t.Fatalf("query sqlite_master: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("want removed view and trigger gone after rebuild, %d still present", n)
+	}
+	var age int64
+	if err := db.QueryRow(`SELECT age FROM users WHERE id = 1`).Scan(&age); err != nil {
+		t.Fatalf("query users: %v", err)
+	}
+	if age != 30 {
+		t.Errorf("want age 30, got %d", age)
+	}
+}
+
+// TestExecute_RowidPreservedWithoutIntegerPrimaryKey covers a rowid table
+// whose primary key isn't a rowid alias: its rowids must survive the copy
+// unchanged, or an FTS5 external-content index keyed on them silently
+// points at the wrong rows.
+func TestExecute_RowidPreservedWithoutIntegerPrimaryKey(t *testing.T) {
+	beforeSQL := `
+		CREATE TABLE notes (slug TEXT PRIMARY KEY, body TEXT) STRICT;
+		CREATE VIRTUAL TABLE notes_fts USING fts5(body, content='notes');
+	`
+	afterSQL := `
+		CREATE TABLE notes (slug TEXT PRIMARY KEY, body TEXT CHECK (length(body) > 0)) STRICT;
+		CREATE VIRTUAL TABLE notes_fts USING fts5(body, content='notes');
+	`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "notes")
+
+	db := openSeededDB(t, beforeSQL, `
+		INSERT INTO notes (slug, body) VALUES ('a', 'apple'), ('b', 'banana'), ('c', 'cherry');
+		INSERT INTO notes_fts (notes_fts) VALUES ('rebuild');
+		INSERT INTO notes_fts (notes_fts, rowid, body) VALUES ('delete', 1, 'apple');
+		DELETE FROM notes WHERE slug = 'a';
+	`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	want := map[string]int64{"b": 2, "c": 3}
+	for slug, rowid := range want {
+		var got int64
+		if err := db.QueryRow(`SELECT rowid FROM notes WHERE slug = ?`, slug).Scan(&got); err != nil {
+			t.Fatalf("query notes %q: %v", slug, err)
+		}
+		if got != rowid {
+			t.Errorf("row %q: want rowid %d, got %d", slug, rowid, got)
+		}
+	}
+
+	var slug string
+	if err := db.QueryRow(`SELECT n.slug FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid WHERE notes_fts MATCH 'cherry'`).Scan(&slug); err != nil {
+		t.Fatalf("fts lookup: %v", err)
+	}
+	if slug != "c" {
+		t.Errorf("want fts match for 'cherry' to resolve to row c, got %q", slug)
+	}
+}
+
+// TestExecute_GeneratedColumnBecomingPlainKeepsValues covers a generated
+// column turned into an ordinary one: pragma_table_info doesn't list
+// generated columns, so without reading pragma_table_xinfo the column
+// looks newly added and every row's value is lost.
+func TestExecute_GeneratedColumnBecomingPlainKeepsValues(t *testing.T) {
+	beforeSQL := `CREATE TABLE sums (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, total INTEGER AS (a + b)) STRICT;`
+	afterSQL := `CREATE TABLE sums (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, total INTEGER) STRICT;`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "sums")
+
+	db := openSeededDB(t, beforeSQL, `INSERT INTO sums (id, a, b) VALUES (1, 2, 3), (2, 10, 20);`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	want := map[int64]int64{1: 5, 2: 30}
+	for id, total := range want {
+		var got sql.NullInt64
+		if err := db.QueryRow(`SELECT total FROM sums WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("query sums %d: %v", id, err)
+		}
+		if !got.Valid || got.Int64 != total {
+			t.Errorf("row %d: want total %d, got %v", id, total, got)
+		}
+	}
+}
+
+// TestExecute_PlainColumnBecomingGeneratedRebuilds covers the reverse
+// direction: the copy must not name the now-generated column as an INSERT
+// target, which SQLite rejects.
+func TestExecute_PlainColumnBecomingGeneratedRebuilds(t *testing.T) {
+	beforeSQL := `CREATE TABLE sums (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, total INTEGER) STRICT;`
+	afterSQL := `CREATE TABLE sums (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, total INTEGER AS (a + b) STORED) STRICT;`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, "sums")
+
+	db := openSeededDB(t, beforeSQL, `INSERT INTO sums (id, a, b, total) VALUES (1, 2, 3, 99);`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	var total int64
+	if err := db.QueryRow(`SELECT total FROM sums WHERE id = 1`).Scan(&total); err != nil {
+		t.Fatalf("query sums: %v", err)
+	}
+	if total != 5 {
+		t.Errorf("want recomputed total 5, got %d", total)
 	}
 }

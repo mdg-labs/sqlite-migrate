@@ -14,9 +14,12 @@ import (
 )
 
 // Generate produces the SQL for rebuilding every table in diffs, given the
-// full schema.sql text the diff's "after" side was parsed from (needed to
-// recover the trigger and view definitions schemadiff.Schema doesn't carry
-// — see preserve.go). Every diff in diffs is assumed to already be a table
+// full schema.sql texts the diff's "before" and "after" sides were parsed
+// from (needed to recover the trigger and view definitions, and the
+// generated columns, schemadiff.Schema doesn't carry — see preserve.go).
+// The before side matters as much as the after side: a trigger or view the
+// migration removes still exists in the database until it's dropped, and
+// breaks the rebuilt table's RENAME just like one that survives. Every diff in diffs is assumed to already be a table
 // the caller has decided needs a full rebuild; Generate itself makes no
 // safe/destructive or rebuild-vs-plain-ALTER decision.
 //
@@ -32,8 +35,8 @@ import (
 // PRAGMA or transaction wrapping, since Runner.Apply wraps every migration
 // file in one transaction with foreign keys suspended, uniformly for every
 // kind of migration.
-func Generate(ctx context.Context, afterSchemaSQL string, diffs []schemadiff.TableDiff) (string, error) {
-	stmts, err := Statements(ctx, afterSchemaSQL, diffs)
+func Generate(ctx context.Context, beforeSchemaSQL, afterSchemaSQL string, diffs []schemadiff.TableDiff) (string, error) {
+	stmts, err := Statements(ctx, beforeSchemaSQL, afterSchemaSQL, diffs)
 	if err != nil {
 		return "", err
 	}
@@ -48,32 +51,39 @@ func Generate(ctx context.Context, afterSchemaSQL string, diffs []schemadiff.Tab
 // caller needs to execute the migration statement-by-statement (as
 // Runner.Apply does) instead of relying on the driver to split a
 // multi-statement string itself.
-func Statements(ctx context.Context, afterSchemaSQL string, diffs []schemadiff.TableDiff) ([]string, error) {
+func Statements(ctx context.Context, beforeSchemaSQL, afterSchemaSQL string, diffs []schemadiff.TableDiff) ([]string, error) {
 	if len(diffs) == 0 {
 		return nil, nil
 	}
 
 	ordered := orderByDependency(diffs)
 
-	catalog, err := loadCatalog(ctx, afterSchemaSQL)
+	tableNames := make([]string, len(ordered))
+	for i, td := range ordered {
+		tableNames[i] = td.Name
+	}
+
+	beforeCat, err := loadCatalog(ctx, beforeSchemaSQL, tableNames)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rebuild: before schema: %w", err)
+	}
+	afterCat, err := loadCatalog(ctx, afterSchemaSQL, tableNames)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild: after schema: %w", err)
 	}
 
 	prepared := make([]tableRebuild, len(ordered))
 	for i, td := range ordered {
-		rb, err := rebuildTable(td)
+		key := asciiLower(td.Name)
+		rb, err := rebuildTable(td, beforeCat.columns[key], afterCat.columns[key])
 		if err != nil {
 			return nil, fmt.Errorf("rebuild: table %q: %w", td.Name, err)
 		}
 		prepared[i] = rb
 	}
 
-	tableNames := make([]string, len(ordered))
-	for i, td := range ordered {
-		tableNames[i] = td.Name
-	}
-	aff := affectedObjects(tableNames, catalog)
+	recreate := affectedObjects(tableNames, afterCat)
+	drop := mergeAffected(affectedObjects(tableNames, beforeCat), recreate)
 
 	var stmts []string
 	// Every trigger or view that references a rebuilt table — or another
@@ -83,7 +93,7 @@ func Statements(ctx context.Context, afterSchemaSQL string, diffs []schemadiff.T
 	// trigger and view in the schema to track the rename, and fails if any
 	// of them currently reference a table missing for the whole rebuild
 	// window — see affectedObjects.
-	stmts = append(stmts, dropAffectedStatements(aff)...)
+	stmts = append(stmts, dropAffectedStatements(drop)...)
 	for _, rb := range prepared {
 		stmts = append(stmts, rb.create, rb.copy)
 		stmts = append(stmts, rb.seqCarry...)
@@ -94,7 +104,7 @@ func Statements(ctx context.Context, afterSchemaSQL string, diffs []schemadiff.T
 	for _, td := range ordered {
 		stmts = append(stmts, indexStatements(td)...)
 	}
-	stmts = append(stmts, recreateAffectedStatements(aff)...)
+	stmts = append(stmts, recreateAffectedStatements(recreate)...)
 
 	return stmts, nil
 }
@@ -115,7 +125,7 @@ func newTableName(table string) string {
 	return table + "_sqlite_migrate_new"
 }
 
-func rebuildTable(td schemadiff.TableDiff) (tableRebuild, error) {
+func rebuildTable(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) (tableRebuild, error) {
 	tmpName := newTableName(td.Name)
 
 	createSQL, err := renameCreateTableSQL(td.After.SQL, tmpName)
@@ -123,14 +133,26 @@ func rebuildTable(td schemadiff.TableDiff) (tableRebuild, error) {
 		return tableRebuild{}, err
 	}
 
-	beforeByName := make(map[string]schemadiff.Column, len(td.Before.Columns))
-	for _, c := range td.Before.Columns {
-		beforeByName[asciiLower(c.Name)] = c
+	// beforeCols includes generated columns: a column that was generated
+	// before and is a plain column after still has a value to carry over,
+	// and reading a generated column in the SELECT is always allowed.
+	beforeByName := make(map[string]tableColumn, len(beforeCols))
+	for _, c := range beforeCols {
+		beforeByName[asciiLower(c.name)] = c
 	}
 
 	var targetCols, sourceCols []string
-	for _, c := range td.After.Columns {
-		bc, ok := beforeByName[asciiLower(c.Name)]
+	if rowid, ok := rowidColumn(td, beforeCols, afterCols); ok {
+		targetCols = append(targetCols, rowid)
+		sourceCols = append(sourceCols, rowid)
+	}
+	for _, c := range afterCols {
+		if c.generated {
+			// SQLite rejects an INSERT naming a generated column; its value
+			// is recomputed from the copied columns instead.
+			continue
+		}
+		bc, ok := beforeByName[asciiLower(c.name)]
 		if !ok {
 			// A column only present after the change (e.g. added alongside
 			// a type change elsewhere in the same table) has no source
@@ -138,8 +160,8 @@ func rebuildTable(td schemadiff.TableDiff) (tableRebuild, error) {
 			// existing row instead.
 			continue
 		}
-		targetCols = append(targetCols, quoteIdent(c.Name))
-		sourceCols = append(sourceCols, quoteIdent(bc.Name))
+		targetCols = append(targetCols, quoteIdent(c.name))
+		sourceCols = append(sourceCols, quoteIdent(bc.name))
 	}
 
 	copySQL := fmt.Sprintf(
@@ -160,6 +182,59 @@ func rebuildTable(td schemadiff.TableDiff) (tableRebuild, error) {
 		rb.seqCarry = autoincrementCarryStatements(td.Name, tmpName)
 	}
 	return rb, nil
+}
+
+// rowidColumn returns the name to copy a rowid table's rowid through, when
+// the rowid isn't already carried by an INTEGER PRIMARY KEY alias column.
+// Without it the copy renumbers every row, silently breaking anything that
+// stores rowids — an FTS5 external-content index (content='t') most of all.
+// It picks the first of SQLite's three rowid spellings that no real column
+// on either side shadows; a table shadowing all three has no way to name
+// its rowid at all, so there is nothing to copy.
+func rowidColumn(td schemadiff.TableDiff, beforeCols, afterCols []tableColumn) (string, bool) {
+	if td.Before.WithoutRowID || td.After.WithoutRowID || hasRowidAlias(td.After) {
+		return "", false
+	}
+	taken := make(map[string]bool, len(beforeCols)+len(afterCols))
+	for _, c := range beforeCols {
+		taken[asciiLower(c.name)] = true
+	}
+	for _, c := range afterCols {
+		taken[asciiLower(c.name)] = true
+	}
+	for _, name := range []string{"rowid", "_rowid_", "oid"} {
+		if !taken[name] {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// hasRowidAlias reports whether a rowid table's primary key is an alias for
+// its rowid. SQLite builds a separate "pk"-origin index for every primary
+// key except exactly that alias case — which, unlike matching the declared
+// type against INTEGER, also gets INTEGER PRIMARY KEY DESC (not an alias)
+// right.
+func hasRowidAlias(t *schemadiff.Table) bool {
+	if t.WithoutRowID {
+		return false
+	}
+	hasPK := false
+	for _, c := range t.Columns {
+		if c.PrimaryKeySeq > 0 {
+			hasPK = true
+			break
+		}
+	}
+	if !hasPK {
+		return false
+	}
+	for _, idx := range t.Indexes {
+		if idx.Origin == "pk" {
+			return false
+		}
+	}
+	return true
 }
 
 // autoincrementCarryStatements carries the old table's sqlite_sequence
