@@ -91,6 +91,27 @@ func TestReferencesTable(t *testing.T) {
 	}
 }
 
+func TestReferencesTable_EmbeddedQuotes(t *testing.T) {
+	cases := []struct {
+		name  string
+		sql   string
+		table string
+	}{
+		{"double quote in double-quoted name", `SELECT * FROM "a""b"`, `a"b`},
+		{"double quote in backticked name", "SELECT * FROM `a\"b`", `a"b`},
+		{"double quote in bracketed name", `SELECT * FROM [a"b]`, `a"b`},
+		{"backtick in backticked name", "SELECT * FROM `a``b`", "a`b"},
+		{"backtick in double-quoted name", "SELECT * FROM \"a`b\"", "a`b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !referencesTable(tc.sql, tc.table) {
+				t.Errorf("referencesTable(%q, %q) = false, want true", tc.sql, tc.table)
+			}
+		})
+	}
+}
+
 func TestOrderByDependency_ParentBeforeChild(t *testing.T) {
 	before := mustParse(t, `
 		CREATE TABLE users (id INTEGER PRIMARY KEY, age TEXT) STRICT;

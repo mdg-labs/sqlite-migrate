@@ -557,6 +557,28 @@ func TestExecute_NonASCIITableNameRebuilds(t *testing.T) {
 	}
 }
 
+func TestExecute_ViewOnTableWithQuoteInNameSurvivesRebuild(t *testing.T) {
+	beforeSQL := `CREATE TABLE "a""b" (x INTEGER) STRICT; CREATE VIEW v AS SELECT * FROM "a""b";`
+	afterSQL := `CREATE TABLE "a""b" (x TEXT) STRICT; CREATE VIEW v AS SELECT * FROM "a""b";`
+	diffs := inlineDiffs(t, beforeSQL, afterSQL, `a"b`)
+
+	db := openSeededDB(t, beforeSQL, `INSERT INTO "a""b" (x) VALUES (7);`)
+
+	stmts, err := Statements(context.Background(), beforeSQL, afterSQL, diffs)
+	if err != nil {
+		t.Fatalf("Statements: %v", err)
+	}
+	applyLikeRunner(t, db, stmts)
+
+	var x string
+	if err := db.QueryRow(`SELECT x FROM v`).Scan(&x); err != nil {
+		t.Fatalf("query v: %v", err)
+	}
+	if x != "7" {
+		t.Errorf("want x = %q, got %q", "7", x)
+	}
+}
+
 // TestExecute_AutoincrementSequenceNotReusedAfterRebuild covers finding 3:
 // a rebuild must carry AUTOINCREMENT's high-water mark over, so a deleted
 // row's id is never handed out again.

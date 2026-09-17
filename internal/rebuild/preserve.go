@@ -321,10 +321,10 @@ func recreateAffectedStatements(aff affected) []string {
 }
 
 // topoSortViews orders views so that any view among them referenced by
-// another view in the set comes first. A cycle between two views can't
-// exist in valid SQLite DDL (each CREATE VIEW must resolve its FROM
-// clauses against tables/views that already exist), so a plain
-// visited-only DFS — never revisiting or cycle-checking a node — is safe.
+// another view in the set comes first. SQLite doesn't resolve a view's
+// references at CREATE VIEW time, so this order isn't required for the
+// script to run; it keeps the output deterministic and readable. The
+// visited set alone also stops the DFS on a (never-queryable) view cycle.
 func topoSortViews(views []catalogObject) []catalogObject {
 	byName := make(map[string]catalogObject, len(views))
 	keys := make([]string, 0, len(views))
@@ -380,7 +380,13 @@ func referencesTable(sql, table string) bool {
 	lower := strings.ToLower(sql)
 	needle := strings.ToLower(table)
 
-	for _, quoted := range []string{`"` + needle + `"`, "`" + needle + "`", "[" + needle + "]"} {
+	// A quote character inside a quoted identifier is written doubled.
+	quotedForms := []string{
+		`"` + strings.ReplaceAll(needle, `"`, `""`) + `"`,
+		"`" + strings.ReplaceAll(needle, "`", "``") + "`",
+		"[" + needle + "]",
+	}
+	for _, quoted := range quotedForms {
 		if strings.Contains(lower, quoted) {
 			return true
 		}
