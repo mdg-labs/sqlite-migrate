@@ -409,6 +409,53 @@ func TestDiff_Destructive_TableDroppedAmongCaseOnlyRenames(t *testing.T) {
 	}
 }
 
+// TestDiff_SQLChanged_QuotedMixedCaseTableNameNoFalsePositive reproduces
+// issue #13: SQLite's ALTER TABLE ... RENAME TO always stores the new name
+// double-quoted in sqlite_master.sql. A mixed-case table name must not
+// register as SQLChanged forever just because the stored form quotes it
+// and the bare schema.sql form doesn't.
+func TestDiff_SQLChanged_QuotedMixedCaseTableNameNoFalsePositive(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE "Users" (id INTEGER PRIMARY KEY) STRICT;`)
+	after := mustParse(t, `CREATE TABLE Users (id INTEGER PRIMARY KEY) STRICT;`)
+
+	d := Diff(before, after)
+	if !d.Empty() {
+		t.Fatalf("want no diff for a quoted-vs-bare mixed-case table name, got %+v", d)
+	}
+}
+
+// TestDiff_SQLChanged_QuotedMixedCaseColumnNameNoFalsePositive is the
+// column-name analog of TestDiff_SQLChanged_QuotedMixedCaseTableNameNoFalsePositive.
+func TestDiff_SQLChanged_QuotedMixedCaseColumnNameNoFalsePositive(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, "Name" TEXT) STRICT;`)
+	after := mustParse(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT) STRICT;`)
+
+	d := Diff(before, after)
+	if !d.Empty() {
+		t.Fatalf("want no diff for a quoted-vs-bare mixed-case column name, got %+v", d)
+	}
+}
+
+// TestDiff_SQLChanged_RebuiltMixedCaseTableNoFalsePositive replays the
+// exact statement sequence internal/rebuild's generator produces for a
+// rebuild — create the replacement table under a suffixed name, then
+// ALTER TABLE ... RENAME TO the original name — so the "before" schema's
+// sqlite_master.sql is SQLite's own quoted rewrite, not a hand-written
+// approximation of it. Diffing that against the plain schema.sql text must
+// come back empty.
+func TestDiff_SQLChanged_RebuiltMixedCaseTableNoFalsePositive(t *testing.T) {
+	rebuilt := mustParse(t, `
+		CREATE TABLE "Users_sqlite_migrate_new" (id INTEGER PRIMARY KEY, name TEXT) STRICT;
+		ALTER TABLE "Users_sqlite_migrate_new" RENAME TO "Users";
+	`)
+	after := mustParse(t, `CREATE TABLE Users (id INTEGER PRIMARY KEY, name TEXT) STRICT;`)
+
+	d := Diff(rebuilt, after)
+	if !d.Empty() {
+		t.Fatalf("want no diff between a rebuilt mixed-case table and its declared schema, got %+v", d)
+	}
+}
+
 func TestDiff_Destructive_ColumnDroppedAmongCaseOnlyRenames(t *testing.T) {
 	before := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, Email TEXT, Nickname TEXT) STRICT;`)
 	after := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT) STRICT;`)

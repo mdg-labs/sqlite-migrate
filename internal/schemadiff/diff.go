@@ -255,7 +255,22 @@ func asciiLower(s string) string {
 // a COLLATE clause, a GENERATED ALWAYS AS expression, and so on) still
 // compares unequal.
 func normalizeSQL(sql string) string {
-	return strings.Join(sqlTokens(sql), " ")
+	tokens := sqlTokens(sql)
+	foldIdentifierPositions(tokens)
+	texts := make([]string, len(tokens))
+	for i, tok := range tokens {
+		texts[i] = tok.text
+	}
+	return strings.Join(texts, " ")
+}
+
+// sqlToken is one token of sqlTokens' output. quoted is set only for a
+// token unwrapped from a double-quoted run: whether its case should be
+// folded depends on where it sits in the statement's grammar, which
+// sqlTokens itself has no way to know.
+type sqlToken struct {
+	text   string
+	quoted bool
 }
 
 // sqlTokens tokenizes SQL source text: whitespace is discarded, comments
@@ -263,15 +278,16 @@ func normalizeSQL(sql string) string {
 // quotes), the backtick- and bracket-quoted identifier forms are unwrapped
 // to their bare, lower-cased name, and every other run of identifier
 // characters is lower-cased. A double-quoted token is unwrapped but its
-// case is kept exactly as written: SQLite's double-quoted string (DQS)
-// fallback treats "…" as a string literal whenever it doesn't name a
-// column, and normalizeSQL has no schema to tell the two cases apart, so
-// folding its case could silently normalize away a genuine change to a
-// CHECK constraint or similar. Everything else (punctuation, operators)
-// becomes a single-character token, so that a change in the whitespace
-// around it never affects the token stream.
-func sqlTokens(s string) []string {
-	var tokens []string
+// case is kept exactly as written here: SQLite's double-quoted string
+// (DQS) fallback treats "…" as a string literal whenever it doesn't name a
+// column, and this tokenizer has no schema to tell the two cases apart on
+// its own. foldIdentifierPositions folds the case of the ones that
+// grammatically must be an identifier (a table or column name) after the
+// fact. Everything else (punctuation, operators) becomes a
+// single-character token, so that a change in the whitespace around it
+// never affects the token stream.
+func sqlTokens(s string) []sqlToken {
+	var tokens []sqlToken
 	n := len(s)
 	for i := 0; i < n; {
 		c := s[i]
@@ -294,23 +310,23 @@ func sqlTokens(s string) []string {
 			}
 		case c == '\'':
 			j := sqlident.ScanQuoted(s, i, '\'')
-			tokens = append(tokens, s[i:j])
+			tokens = append(tokens, sqlToken{text: s[i:j]})
 			i = j
 		case c == '"':
 			j := sqlident.ScanQuoted(s, i, c)
-			tokens = append(tokens, sqlident.Unquote(s[i:j], c))
+			tokens = append(tokens, sqlToken{text: sqlident.Unquote(s[i:j], c), quoted: true})
 			i = j
 		case c == '`':
 			j := sqlident.ScanQuoted(s, i, c)
-			tokens = append(tokens, asciiLower(sqlident.Unquote(s[i:j], c)))
+			tokens = append(tokens, sqlToken{text: asciiLower(sqlident.Unquote(s[i:j], c))})
 			i = j
 		case c == '[':
 			j := strings.IndexByte(s[i:], ']')
 			if j < 0 {
-				tokens = append(tokens, asciiLower(s[i+1:]))
+				tokens = append(tokens, sqlToken{text: asciiLower(s[i+1:])})
 				i = n
 			} else {
-				tokens = append(tokens, asciiLower(s[i+1:i+j]))
+				tokens = append(tokens, sqlToken{text: asciiLower(s[i+1 : i+j])})
 				i += j + 1
 			}
 		case sqlident.IsIdentByte(c):
@@ -318,12 +334,101 @@ func sqlTokens(s string) []string {
 			for j < n && sqlident.IsIdentByte(s[j]) {
 				j++
 			}
-			tokens = append(tokens, asciiLower(s[i:j]))
+			tokens = append(tokens, sqlToken{text: asciiLower(s[i:j])})
 			i = j
 		default:
-			tokens = append(tokens, string(c))
+			tokens = append(tokens, sqlToken{text: string(c)})
 			i++
 		}
 	}
 	return tokens
+}
+
+// tableConstraintKeywords are the tokens that start a table constraint
+// rather than a column definition in a CREATE TABLE's column list, per
+// SQLite's grammar. A quoted constraint name (e.g. CONSTRAINT "pk_users")
+// is left as-is: only the table name and column names are folded here.
+var tableConstraintKeywords = map[string]bool{
+	"constraint": true,
+	"primary":    true,
+	"unique":     true,
+	"check":      true,
+	"foreign":    true,
+}
+
+// foldIdentifierPositions folds the case of quoted tokens that sit where
+// SQLite's grammar requires an identifier — a CREATE TABLE's own table
+// name, and each column's name at the start of its definition — since
+// SQLite identifiers compare case-insensitively there regardless of
+// quoting style. It leaves every other token, quoted or not, untouched:
+// in particular the contents of a CHECK, DEFAULT or GENERATED expression,
+// where a double-quoted token still might be a DQS string literal whose
+// case is a genuine change.
+func foldIdentifierPositions(tokens []sqlToken) {
+	n := len(tokens)
+	i := 0
+	for i < n && tokens[i].text != "create" {
+		i++
+	}
+	if i >= n {
+		return
+	}
+	i++
+	for i < n && (tokens[i].text == "temp" || tokens[i].text == "temporary") {
+		i++
+	}
+	if i >= n || tokens[i].text != "table" {
+		return
+	}
+	i++
+	if i+2 < n && tokens[i].text == "if" && tokens[i+1].text == "not" && tokens[i+2].text == "exists" {
+		i += 3
+	}
+	if i >= n {
+		return
+	}
+
+	nameIdx := i
+	if i+2 < n && tokens[i+1].text == "." {
+		nameIdx = i + 2
+		i += 3
+	} else {
+		i++
+	}
+	if nameIdx < n && tokens[nameIdx].quoted {
+		tokens[nameIdx].text = asciiLower(tokens[nameIdx].text)
+	}
+
+	for i < n && tokens[i].text != "(" {
+		i++
+	}
+	if i >= n {
+		return
+	}
+	i++
+
+	depth := 1
+	atFieldStart := true
+	for i < n && depth > 0 {
+		switch tokens[i].text {
+		case "(":
+			depth++
+			atFieldStart = false
+		case ")":
+			depth--
+			atFieldStart = false
+		case ",":
+			if depth == 1 {
+				atFieldStart = true
+			}
+		default:
+			if depth == 1 && atFieldStart {
+				if tokens[i].quoted && !tableConstraintKeywords[tokens[i].text] {
+					tokens[i].text = asciiLower(tokens[i].text)
+				}
+				atFieldStart = false
+			}
+		}
+		i++
+	}
 }
