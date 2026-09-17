@@ -332,18 +332,9 @@ func sqlTokens(s string) []sqlToken {
 				tokens = append(tokens, sqlToken{text: asciiLower(s[i+1 : i+j])})
 				i += j + 1
 			}
-		// A byte with the high bit set is part of a multi-byte UTF-8
-		// identifier character, and '$' is an ordinary (if unusual)
-		// identifier byte too; SQLite's own tokenizer treats both as
-		// identifier bytes (verified directly: CREATE TABLE t (café
-		// INTEGER) and CREATE TABLE "foo$bar" are both accepted with their
-		// name unquoted), so they must stay fused into their identifier's
-		// single token here too — otherwise the identifier fragments into
-		// one garbled token per raw byte, or splits at the '$', and never
-		// compares equal to itself.
-		case c == '$' || c >= 0x80 || sqlident.IsIdentByte(c):
+		case sqlident.IsIdentByte(c):
 			j := i + 1
-			for j < n && (s[j] == '$' || s[j] >= 0x80 || sqlident.IsIdentByte(s[j])) {
+			for j < n && sqlident.IsIdentByte(s[j]) {
 				j++
 			}
 			tokens = append(tokens, sqlToken{text: asciiLower(s[i:j])})

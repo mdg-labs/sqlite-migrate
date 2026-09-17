@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -58,6 +59,16 @@ func ReplaySchema(ctx context.Context, migrations []Migration) ([]SchemaObject, 
 	db.SetMaxOpenConns(1)
 
 	for _, m := range migrations {
+		// modernc.org/sqlite silently stops executing at the first NUL byte
+		// in a query string and reports no error at all, so a migration
+		// file corrupted to contain one would replay as if truncated there
+		// rather than fail — which would make the drift check compare a
+		// truncated replay against a truncated apply and see no drift at
+		// all. Refusing outright, before executing any of it, is the only
+		// safe response.
+		if i := strings.IndexByte(m.SQL, 0); i >= 0 {
+			return nil, fmt.Errorf("sqlitemigrate: migration %q contains a NUL byte at offset %d", m.Filename, i)
+		}
 		if _, err := db.ExecContext(ctx, m.SQL); err != nil {
 			return nil, fmt.Errorf("sqlitemigrate: replay migration %q: %w", m.Filename, err)
 		}

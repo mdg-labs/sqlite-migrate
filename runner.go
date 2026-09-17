@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -285,6 +286,16 @@ func (r *Runner) applyInTransaction(ctx context.Context, db *sql.DB, sorted []Mi
 	}
 
 	for _, m := range pending {
+		// modernc.org/sqlite silently stops executing at the first NUL byte
+		// in a query string and reports no error at all (verified directly
+		// by Phase 8 fuzzing of a different package's identical call
+		// pattern), so a migration file corrupted to contain one would
+		// apply only the statements before it while still being recorded
+		// below as fully applied — refusing outright, before executing any
+		// of it, is the only safe response.
+		if i := strings.IndexByte(m.SQL, 0); i >= 0 {
+			return nil, fmt.Errorf("sqlitemigrate: migration %s contains a NUL byte at offset %d", m.Filename, i)
+		}
 		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
 			return nil, fmt.Errorf("sqlitemigrate: apply migration %s: %w", m.Filename, err)
 		}

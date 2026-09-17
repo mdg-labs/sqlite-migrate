@@ -1,0 +1,4 @@
+CREATE TABLE bücher (
+    id INTEGER PRIMARY KEY,
+    titel TEXT
+) STRICT;
