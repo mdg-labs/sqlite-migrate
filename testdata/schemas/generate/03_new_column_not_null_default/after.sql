@@ -1,0 +1,5 @@
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    email TEXT,
+    credits INTEGER NOT NULL DEFAULT 0
+) STRICT;

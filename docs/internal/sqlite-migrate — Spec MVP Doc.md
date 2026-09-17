@@ -222,7 +222,7 @@ Content: how to author/edit `schema.sql` (the `STRICT` requirement, why it's the
 | 02 | New column, no constraints | Safe — direct `ADD COLUMN` |
 | 03 | New column with `NOT NULL DEFAULT` | Safe — direct `ADD COLUMN` |
 | 04 | New column with `REFERENCES` | Safe — direct `ADD COLUMN`, FK clause preserved |
-| 05 | New column with `REFERENCES` + non-NULL default | Refused outright — SQLite itself rejects this combination |
+| 05 | New column with `REFERENCES` + non-NULL default | Safe — direct `ADD COLUMN`; SQLite only rejects this combination once the table already holds rows and `foreign_keys` enforcement is on, a state neither `generate` (schema-only replay) nor `Runner.Apply` (which suspends `foreign_keys` for the whole migration transaction) ever reaches |
 | 06 | New index | Safe — direct `CREATE INDEX` |
 | 07 | Existing column's type changed | Safe — full rebuild, no column lost |
 | 08 | `CHECK` constraint added to existing column | Safe — full rebuild |

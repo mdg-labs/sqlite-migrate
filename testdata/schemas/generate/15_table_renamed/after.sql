@@ -1,0 +1,3 @@
+CREATE TABLE purchases (
+    id INTEGER PRIMARY KEY
+) STRICT;
