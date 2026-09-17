@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"time"
@@ -15,11 +16,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// busyTimeoutMillis bounds how long a connection waits on SQLITE_BUSY
+// BusyTimeoutMillis bounds how long a connection waits on SQLITE_BUSY
 // before giving up, so a brief lock held by another process or connection
 // (e.g. a concurrent read of the same database) doesn't fail Apply or
 // Snapshot outright.
-const busyTimeoutMillis = 5000
+const BusyTimeoutMillis = 5000
 
 // Runner applies a sequence of Migration values to a database over a
 // single pinned connection. Apply runs each pending migration inside one
@@ -88,6 +89,121 @@ func (r *Runner) snapshotDir() string {
 	return filepath.Dir(r.DBPath)
 }
 
+// AppliedMigration is one row of the bookkeeping table Apply records
+// progress in.
+type AppliedMigration struct {
+	Version   string
+	Slug      string
+	Checksum  string
+	AppliedAt string
+}
+
+// Applied reads r's bookkeeping table and reports every migration recorded
+// as applied, in version order. A database file that doesn't exist yet, or
+// one that exists but hasn't been migrated yet, both report no applied
+// migrations — Applied never opens a connection when the file is missing,
+// so inspecting a not-yet-created target never creates it as a side
+// effect. This is the one read-only counterpart to Apply's write path, so
+// callers that need to know what's already applied — a status report, a
+// dry run — never have to know the bookkeeping table's name or schema
+// themselves.
+func (r *Runner) Applied(ctx context.Context) ([]AppliedMigration, error) {
+	if _, err := os.Stat(r.DBPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sqlitemigrate: stat database %q: %w", r.DBPath, err)
+	}
+
+	db, err := sql.Open("sqlite", r.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: open database %q: %w", r.DBPath, err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", BusyTimeoutMillis)); err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: set busy_timeout: %w", err)
+	}
+
+	var tableCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, schemaMigrationsTable,
+	).Scan(&tableCount); err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: check bookkeeping table: %w", err)
+	}
+	if tableCount == 0 {
+		return nil, nil
+	}
+
+	rows, err := db.QueryContext(ctx,
+		`SELECT version, slug, checksum, applied_at FROM `+schemaMigrationsTable+` ORDER BY version`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: read %s: %w", schemaMigrationsTable, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var applied []AppliedMigration
+	for rows.Next() {
+		var a AppliedMigration
+		if err := rows.Scan(&a.Version, &a.Slug, &a.Checksum, &a.AppliedAt); err != nil {
+			return nil, fmt.Errorf("sqlitemigrate: scan %s row: %w", schemaMigrationsTable, err)
+		}
+		applied = append(applied, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: read %s: %w", schemaMigrationsTable, err)
+	}
+	return applied, nil
+}
+
+// PendingMigrations reports which of migrations aren't yet recorded in
+// applied, enforcing the same immutability checks Apply itself performs
+// before running anything: a recorded migration whose checksum no longer
+// matches its file, or one with no matching file at all, is refused rather
+// than silently skipped. Apply's own transaction runs this identical check
+// against the database it just opened, so a caller — such as a dry run —
+// that calls PendingMigrations against the result of Applied predicts
+// exactly what Apply will do.
+func PendingMigrations(migrations []Migration, applied []AppliedMigration) ([]Migration, error) {
+	sorted := make([]Migration, len(migrations))
+	copy(sorted, migrations)
+	sortMigrations(sorted)
+
+	recorded := make(map[string]string, len(applied))
+	for _, a := range applied {
+		recorded[a.Version] = a.Checksum
+	}
+
+	return pendingAgainstRecorded(sorted, recorded)
+}
+
+// pendingAgainstRecorded is the immutability check shared by
+// applyInTransaction (checking against the bookkeeping table it just read
+// inside the transaction) and PendingMigrations (checking against an
+// Applied snapshot read outside one), so the two never drift apart.
+func pendingAgainstRecorded(sorted []Migration, recorded map[string]string) ([]Migration, error) {
+	var pending []Migration
+	sortedVersions := make(map[string]struct{}, len(sorted))
+	for _, m := range sorted {
+		sortedVersions[m.Version] = struct{}{}
+		want, ok := recorded[m.Version]
+		if !ok {
+			pending = append(pending, m)
+			continue
+		}
+		if want != m.Checksum {
+			return nil, &ChecksumMismatchError{Version: m.Version, Want: want, Got: m.Checksum}
+		}
+	}
+	for version := range recorded {
+		if _, ok := sortedVersions[version]; !ok {
+			return nil, &MissingMigrationError{Version: version}
+		}
+	}
+	return pending, nil
+}
+
 // Snapshot backs up r's database via VACUUM INTO into r's snapshot
 // directory, per Safety Model: an atomic, single-file image safe to
 // restore from at any time, never a raw copy of a live database. It
@@ -130,7 +246,7 @@ func (r *Runner) Apply(ctx context.Context, migrations []Migration) ([]Migration
 	// transaction a different connection than the one the PRAGMA ran on.
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", busyTimeoutMillis)); err != nil {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", BusyTimeoutMillis)); err != nil {
 		return nil, fmt.Errorf("sqlitemigrate: set busy_timeout: %w", err)
 	}
 
@@ -163,23 +279,9 @@ func (r *Runner) applyInTransaction(ctx context.Context, db *sql.DB, sorted []Mi
 		return nil, err
 	}
 
-	var pending []Migration
-	sortedVersions := make(map[string]struct{}, len(sorted))
-	for _, m := range sorted {
-		sortedVersions[m.Version] = struct{}{}
-		want, ok := recorded[m.Version]
-		if !ok {
-			pending = append(pending, m)
-			continue
-		}
-		if want != m.Checksum {
-			return nil, &ChecksumMismatchError{Version: m.Version, Want: want, Got: m.Checksum}
-		}
-	}
-	for version := range recorded {
-		if _, ok := sortedVersions[version]; !ok {
-			return nil, &MissingMigrationError{Version: version}
-		}
+	pending, err := pendingAgainstRecorded(sorted, recorded)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, m := range pending {
