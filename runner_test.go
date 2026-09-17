@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -175,6 +176,34 @@ func asChecksumMismatch(err error, target **ChecksumMismatchError) bool {
 		return true
 	}
 	return false
+}
+
+func TestApply_DetectsDeletedMigrationFile(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "app.db")
+	r := newRunner(t, dbPath)
+
+	m := Migration{Version: "20260101000000", Slug: "init", Filename: "20260101000000_init.sql", SQL: `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`}
+	m.Checksum = Checksum(m.SQL)
+
+	if _, err := r.Apply(ctx, []Migration{m}); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+
+	// The migration's file is gone from the set Apply is given, as if it had
+	// been deleted from the migrations directory after being applied. This
+	// must be caught the same way editing it in place is.
+	_, err := r.Apply(ctx, nil)
+	if err == nil {
+		t.Fatal("Apply accepted a migration file deleted after being applied")
+	}
+	var missing *MissingMigrationError
+	if !errors.As(err, &missing) {
+		t.Fatalf("Apply returned %v, want a *MissingMigrationError", err)
+	}
+	if missing.Version != m.Version {
+		t.Errorf("MissingMigrationError.Version = %q, want %q", missing.Version, m.Version)
+	}
 }
 
 func TestApply_ForeignKeyViolationRollsBackWholeBatch(t *testing.T) {

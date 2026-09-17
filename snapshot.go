@@ -12,12 +12,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// SnapshotWarning reports that Snapshot successfully created and renamed a
+// backup file at a final, valid path, but a step that affects only that
+// backup's durability or housekeeping — never its validity as a restorable,
+// byte-correct image — failed afterward. Callers may treat the returned
+// path as a good backup and proceed; Runner.Apply does.
+type SnapshotWarning struct {
+	Err error
+}
+
+func (e *SnapshotWarning) Error() string { return e.Err.Error() }
+func (e *SnapshotWarning) Unwrap() error { return e.Err }
 
 const snapshotTimestampLayout = "20060102150405"
 
@@ -93,6 +107,11 @@ func Snapshot(ctx context.Context, dbPath, dir string, retain int) (string, erro
 	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", busyTimeoutMillis)); err != nil {
+		_ = os.Remove(final)
+		return "", fmt.Errorf("sqlitemigrate: set busy_timeout: %w", err)
+	}
+
 	if _, err := db.ExecContext(ctx, `VACUUM INTO ?`, tmp); err != nil {
 		_ = os.Remove(tmp)
 		_ = os.Remove(final)
@@ -111,11 +130,36 @@ func Snapshot(ctx context.Context, dbPath, dir string, retain int) (string, erro
 		return "", fmt.Errorf("sqlitemigrate: rename snapshot into place: %w", err)
 	}
 
+	// The rename above is on disk and final is a valid, complete snapshot
+	// from here on regardless of what follows; syncing the directory entry
+	// only strengthens the guarantee that the rename survives a crash, so
+	// its failure is a durability warning, not a reason to discard a good
+	// backup.
+	if err := syncDir(dir); err != nil {
+		return final, &SnapshotWarning{Err: err}
+	}
+
 	if err := pruneSnapshots(dbPath, dir, retain); err != nil {
-		return final, err
+		return final, &SnapshotWarning{Err: err}
 	}
 
 	return final, nil
+}
+
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("sqlitemigrate: open snapshot directory %q to sync: %w", dir, err)
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sqlitemigrate: sync snapshot directory %q: %w", dir, syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("sqlitemigrate: close snapshot directory %q after sync: %w", dir, closeErr)
+	}
+	return nil
 }
 
 func syncFile(path string) error {
@@ -134,6 +178,13 @@ func syncFile(path string) error {
 	return nil
 }
 
+// snapshotNamePattern parses a name built by snapshotName back into its
+// timestamp and attempt, so pruneSnapshots can order snapshots by age
+// numerically instead of lexicographically — a plain string sort puts
+// "...-10.snapshot" before "...-2.snapshot" once double-digit attempts
+// appear.
+var snapshotNamePattern = regexp.MustCompile(`\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+
 // pruneSnapshots removes the oldest snapshot files for dbPath in dir until
 // at most retain remain. retain <= 0 disables pruning: every snapshot is
 // kept.
@@ -148,22 +199,41 @@ func pruneSnapshots(dbPath, dir string, retain int) error {
 		return fmt.Errorf("sqlitemigrate: list snapshot directory %q: %w", dir, err)
 	}
 
-	var names []string
+	type snapshotFile struct {
+		name    string
+		stamp   string
+		attempt int
+	}
+
+	var files []snapshotFile
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".snapshot") {
 			continue
 		}
-		names = append(names, name)
+		m := snapshotNamePattern.FindStringSubmatch(name)
+		if m == nil {
+			continue
+		}
+		attempt := 0
+		if m[2] != "" {
+			attempt, _ = strconv.Atoi(m[2])
+		}
+		files = append(files, snapshotFile{name: name, stamp: m[1], attempt: attempt})
 	}
-	sort.Strings(names)
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].stamp != files[j].stamp {
+			return files[i].stamp < files[j].stamp
+		}
+		return files[i].attempt < files[j].attempt
+	})
 
-	if len(names) <= retain {
+	if len(files) <= retain {
 		return nil
 	}
-	for _, name := range names[:len(names)-retain] {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil {
-			return fmt.Errorf("sqlitemigrate: prune snapshot %q: %w", name, err)
+	for _, f := range files[:len(files)-retain] {
+		if err := os.Remove(filepath.Join(dir, f.name)); err != nil {
+			return fmt.Errorf("sqlitemigrate: prune snapshot %q: %w", f.name, err)
 		}
 	}
 	return nil

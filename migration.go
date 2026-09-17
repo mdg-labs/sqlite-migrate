@@ -10,6 +10,7 @@ package sqlitemigrate
 // for Runner.Apply to consume.
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -44,7 +45,11 @@ type Migration struct {
 // Load parses a single migration from filename and its SQL body read from
 // r. filename must follow the "<timestamp>_<slug>.sql" convention; only
 // its base name is significant, so callers may pass a full path.
-func Load(filename string, r io.Reader) (Migration, error) {
+func Load(ctx context.Context, filename string, r io.Reader) (Migration, error) {
+	if err := ctx.Err(); err != nil {
+		return Migration{}, err
+	}
+
 	base := path.Base(filename)
 	m := filenamePattern.FindStringSubmatch(base)
 	if m == nil {
@@ -72,7 +77,11 @@ func Load(filename string, r io.Reader) (Migration, error) {
 // version. It is an error for two files to share a version: a genuine
 // collision (e.g. two branches generating a migration independently) must
 // be visible immediately rather than silently resolved by file order.
-func LoadDir(fsys fs.FS, dir string) ([]Migration, error) {
+func LoadDir(ctx context.Context, fsys fs.FS, dir string) ([]Migration, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
 		return nil, fmt.Errorf("sqlitemigrate: read migration directory %q: %w", dir, err)
@@ -88,7 +97,7 @@ func LoadDir(fsys fs.FS, dir string) ([]Migration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("sqlitemigrate: open migration %q: %w", entry.Name(), err)
 		}
-		m, err := Load(entry.Name(), f)
+		m, err := Load(ctx, entry.Name(), f)
 		closeErr := f.Close()
 		if err != nil {
 			return nil, err
@@ -102,12 +111,10 @@ func LoadDir(fsys fs.FS, dir string) ([]Migration, error) {
 
 	sort.Slice(migrations, func(i, j int) bool { return migrations[i].Version < migrations[j].Version })
 
-	seen := make(map[string]string, len(migrations))
-	for _, m := range migrations {
-		if prior, ok := seen[m.Version]; ok {
-			return nil, fmt.Errorf("sqlitemigrate: migration version %q used by both %q and %q", m.Version, prior, m.Filename)
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].Version == migrations[i-1].Version {
+			return nil, fmt.Errorf("sqlitemigrate: migration version %q used by both %q and %q", migrations[i].Version, migrations[i-1].Filename, migrations[i].Filename)
 		}
-		seen[m.Version] = m.Filename
 	}
 
 	return migrations, nil

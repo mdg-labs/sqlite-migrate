@@ -1,14 +1,16 @@
 package sqlitemigrate
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"testing/fstest"
 )
 
 func TestLoad_ParsesFilenameConvention(t *testing.T) {
+	ctx := context.Background()
 	sql := "CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;\n"
-	m, err := Load("20260917143022_add_users.sql", strings.NewReader(sql))
+	m, err := Load(ctx, "20260917143022_add_users.sql", strings.NewReader(sql))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -27,6 +29,7 @@ func TestLoad_ParsesFilenameConvention(t *testing.T) {
 }
 
 func TestLoad_RejectsBadFilenames(t *testing.T) {
+	ctx := context.Background()
 	cases := []string{
 		"add_users.sql",
 		"2026_add_users.sql",
@@ -34,20 +37,21 @@ func TestLoad_RejectsBadFilenames(t *testing.T) {
 		"20260917143022_add_users.txt",
 	}
 	for _, name := range cases {
-		if _, err := Load(name, strings.NewReader("")); err == nil {
+		if _, err := Load(ctx, name, strings.NewReader("")); err == nil {
 			t.Errorf("Load(%q) succeeded, want an error", name)
 		}
 	}
 }
 
 func TestLoadDir_SortsByVersion(t *testing.T) {
+	ctx := context.Background()
 	fsys := fstest.MapFS{
 		"migrations/20260917143022_add_users.sql": &fstest.MapFile{Data: []byte("CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;")},
 		"migrations/20260101000000_init.sql":      &fstest.MapFile{Data: []byte("CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT;")},
 		"migrations/README.md":                    &fstest.MapFile{Data: []byte("not a migration")},
 	}
 
-	migrations, err := LoadDir(fsys, "migrations")
+	migrations, err := LoadDir(ctx, fsys, "migrations")
 	if err != nil {
 		t.Fatalf("LoadDir: %v", err)
 	}
@@ -60,12 +64,13 @@ func TestLoadDir_SortsByVersion(t *testing.T) {
 }
 
 func TestLoadDir_RejectsDuplicateVersions(t *testing.T) {
+	ctx := context.Background()
 	fsys := fstest.MapFS{
 		"migrations/20260917143022_add_users.sql":  &fstest.MapFile{Data: []byte("CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;")},
 		"migrations/20260917143022_add_orders.sql": &fstest.MapFile{Data: []byte("CREATE TABLE orders (id INTEGER PRIMARY KEY) STRICT;")},
 	}
 
-	if _, err := LoadDir(fsys, "migrations"); err == nil {
+	if _, err := LoadDir(ctx, fsys, "migrations"); err == nil {
 		t.Fatal("LoadDir accepted two migrations sharing the same version")
 	}
 }

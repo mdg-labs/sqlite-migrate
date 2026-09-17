@@ -6,6 +6,7 @@ package sqlitemigrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,12 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// busyTimeoutMillis bounds how long a connection waits on SQLITE_BUSY
+// before giving up, so a brief lock held by another process or connection
+// (e.g. a concurrent read of the same database) doesn't fail Apply or
+// Snapshot outright.
+const busyTimeoutMillis = 5000
 
 // Runner applies a sequence of Migration values to a database over a
 // single pinned connection. Apply runs each pending migration inside one
@@ -60,6 +67,18 @@ func (e *ChecksumMismatchError) Error() string {
 	return fmt.Sprintf("sqlitemigrate: migration %s checksum mismatch: recorded %s, got %s (file was edited after being applied)", e.Version, e.Want, e.Got)
 }
 
+// MissingMigrationError reports that a migration recorded as applied has
+// no corresponding entry in the migrations Apply was given — its file was
+// deleted after being applied, which the immutability guarantee treats the
+// same as an edited file.
+type MissingMigrationError struct {
+	Version string
+}
+
+func (e *MissingMigrationError) Error() string {
+	return fmt.Sprintf("sqlitemigrate: migration %s is recorded as applied but its file is missing (file was deleted after being applied)", e.Version)
+}
+
 // snapshotDir returns r's configured snapshot directory, defaulting to
 // DBPath's own directory.
 func (r *Runner) snapshotDir() string {
@@ -93,7 +112,10 @@ func (r *Runner) Apply(ctx context.Context, migrations []Migration) ([]Migration
 	sortMigrations(sorted)
 
 	if _, err := r.Snapshot(ctx); err != nil {
-		return nil, fmt.Errorf("sqlitemigrate: backup before apply: %w", err)
+		var warn *SnapshotWarning
+		if !errors.As(err, &warn) {
+			return nil, fmt.Errorf("sqlitemigrate: backup before apply: %w", err)
+		}
 	}
 
 	db, err := sql.Open("sqlite", r.DBPath)
@@ -107,6 +129,10 @@ func (r *Runner) Apply(ctx context.Context, migrations []Migration) ([]Migration
 	// and database/sql's pool would otherwise be free to hand the
 	// transaction a different connection than the one the PRAGMA ran on.
 	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", busyTimeoutMillis)); err != nil {
+		return nil, fmt.Errorf("sqlitemigrate: set busy_timeout: %w", err)
+	}
 
 	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
 		return nil, fmt.Errorf("sqlitemigrate: suspend foreign_keys before apply: %w", err)
@@ -138,7 +164,9 @@ func (r *Runner) applyInTransaction(ctx context.Context, db *sql.DB, sorted []Mi
 	}
 
 	var pending []Migration
+	sortedVersions := make(map[string]struct{}, len(sorted))
 	for _, m := range sorted {
+		sortedVersions[m.Version] = struct{}{}
 		want, ok := recorded[m.Version]
 		if !ok {
 			pending = append(pending, m)
@@ -146,6 +174,11 @@ func (r *Runner) applyInTransaction(ctx context.Context, db *sql.DB, sorted []Mi
 		}
 		if want != m.Checksum {
 			return nil, &ChecksumMismatchError{Version: m.Version, Want: want, Got: m.Checksum}
+		}
+	}
+	for version := range recorded {
+		if _, ok := sortedVersions[version]; !ok {
+			return nil, &MissingMigrationError{Version: version}
 		}
 	}
 

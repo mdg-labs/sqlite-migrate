@@ -173,3 +173,44 @@ func TestSnapshot_PrunesOldSnapshotsPastRetention(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshot_PrunesByNumericAttemptNotLexicographicOrder(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "app.db")
+
+	db := openFileDB(t, dbPath)
+	if _, err := db.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT;`); err != nil {
+		t.Fatalf("seed database: %v", err)
+	}
+
+	snapshotDir := filepath.Join(dir, "snapshots")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatalf("mkdir snapshot dir: %v", err)
+	}
+	// Same-second collision names: a plain lexicographic sort orders
+	// "-10" before "-2" (ASCII '1' < '2'), which would make pruneSnapshots
+	// delete the numerically newest attempt while keeping older ones.
+	stamp := "20260101000000"
+	oldest := filepath.Join(snapshotDir, "app.db."+stamp+".snapshot")
+	attempt2 := filepath.Join(snapshotDir, "app.db."+stamp+"-2.snapshot")
+	attempt10 := filepath.Join(snapshotDir, "app.db."+stamp+"-10.snapshot")
+	for _, p := range []string{oldest, attempt2, attempt10} {
+		if err := os.WriteFile(p, []byte("placeholder"), 0o644); err != nil {
+			t.Fatalf("seed snapshot file %q: %v", p, err)
+		}
+	}
+
+	if err := pruneSnapshots(dbPath, snapshotDir, 2); err != nil {
+		t.Fatalf("pruneSnapshots: %v", err)
+	}
+
+	if _, err := os.Stat(oldest); !os.IsNotExist(err) {
+		t.Errorf("oldest snapshot %q was not pruned", oldest)
+	}
+	for _, p := range []string{attempt2, attempt10} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("retained snapshot %q missing: %v", p, err)
+		}
+	}
+}
