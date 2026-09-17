@@ -53,15 +53,15 @@ directory and a SQLite file the user names.
 | `area:sqldefwrap` | `internal/sqldefwrap/` |
 | `area:runtime` | `migration.go`, `runner.go`, `snapshot.go`, `drift.go`, `checksum.go`, and their `*_test.go` |
 | `area:cli` | `cmd/sqlite-migrate/` |
-| `area:docs` | `README.md`, `site/`, `docs/internal/` (see note below) |
+| `area:docs` | `README.md`, `docs/public/`, `docs/internal/` (see note below) |
 | `area:ci` | `.github/workflows/`, `Makefile`, `.golangci.yml` |
 | `area:skill` | `skills/sqlite-migrate/` |
 
 **`docs/internal/` is maintainer-facing** (this spec doc, decision records)
 and is never the source for the published GitHub Pages site — that source
-is `site/`. A `docs` issue touching `docs/internal/` and one touching
-`site/` both carry `area:docs`; the scope note in the issue body says which
-path, so `build` can still bound it precisely.
+is `docs/public/`. A `docs` issue touching `docs/internal/` and one touching
+`docs/public/` both carry `area:docs`; the scope note in the issue body
+says which path, so `build` can still bound it precisely.
 
 **Always-shared files** — any change touching them serializes against every
 other change that does: `CLAUDE.md`, `Makefile`, `go.mod`, `go.sum`,
