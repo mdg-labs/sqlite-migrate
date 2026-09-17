@@ -20,9 +20,11 @@ func RunApply(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	var dbPath, dir string
 	var yes bool
+	var retainSnapshots int
 	fs.StringVar(&dbPath, "db", "", "path to the target SQLite database file")
 	fs.StringVar(&dir, "dir", "migrations", "directory holding generated migration files")
 	fs.BoolVar(&yes, "yes", false, "apply pending migrations; without this flag, apply only prints what would run")
+	fs.IntVar(&retainSnapshots, "retain-snapshots", 0, "snapshot files to keep per database after a successful apply; 0 keeps every snapshot")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -44,7 +46,7 @@ func RunApply(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "apply: %v\n", err)
 			return 1
 		}
-		pending, err := pendingMigrations(migrations, applied)
+		pending, err := sqlitemigrate.PendingMigrations(migrations, applied)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "apply: %v\n", err)
 			return 1
@@ -53,7 +55,7 @@ func RunApply(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	runner := &sqlitemigrate.Runner{DBPath: dbPath}
+	runner := &sqlitemigrate.Runner{DBPath: dbPath, RetainSnapshots: retainSnapshots}
 	applied, err := runner.Apply(ctx, migrations)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "apply: %v\n", err)

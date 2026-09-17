@@ -49,13 +49,17 @@ func RunVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	defer func() { _ = db.Close() }()
 
-	actual, err := sqlitemigrate.CaptureSchema(ctx, db)
+	// deployed is the target database's real, captured schema — CheckDrift
+	// takes it as its "expected" side and replays migrations itself as the
+	// "actual" side, so a drift report's OnlyInExpected/OnlyInActual read as
+	// "in the database"/"in the journal" below.
+	deployed, err := sqlitemigrate.CaptureSchema(ctx, db)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "verify: %v\n", err)
 		return 1
 	}
 
-	report, err := sqlitemigrate.CheckDrift(ctx, migrations, actual)
+	report, err := sqlitemigrate.CheckDrift(ctx, migrations, deployed)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "verify: %v\n", err)
 		return 1

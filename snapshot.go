@@ -107,7 +107,7 @@ func Snapshot(ctx context.Context, dbPath, dir string, retain int) (string, erro
 	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", busyTimeoutMillis)); err != nil {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", BusyTimeoutMillis)); err != nil {
 		_ = os.Remove(final)
 		return "", fmt.Errorf("sqlitemigrate: set busy_timeout: %w", err)
 	}

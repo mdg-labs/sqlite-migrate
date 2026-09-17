@@ -1,8 +1,7 @@
 // runtime.go holds the pieces the apply/check/verify/status subcommands
-// share: loading the migration journal from disk, and reading a target
-// database's bookkeeping table directly (Runner itself only exposes a full
-// transactional Apply, never a read-only query) to tell which migrations
-// it has already recorded as applied.
+// share: loading the migration journal from disk, and opening direct,
+// read-only connections to a target database for commands that don't run a
+// migration (status, verify).
 package main
 
 import (
@@ -15,15 +14,6 @@ import (
 
 	_ "modernc.org/sqlite"
 )
-
-// bookkeepingTable is Runner's bookkeeping table name (see runner.go).
-const bookkeepingTable = "schema_migrations"
-
-// appliedMigration is one row of the bookkeeping table.
-type appliedMigration struct {
-	Checksum  string
-	AppliedAt string
-}
 
 // loadMigrations loads every migration file in dir, sorted by version. A
 // missing directory is a cold repo, not an error: there are no migrations
@@ -43,90 +33,27 @@ func loadMigrations(ctx context.Context, dir string) ([]sqlitemigrate.Migration,
 }
 
 // openDB opens dbPath through the same pure-Go driver the runtime package
-// uses, pinned to a single connection.
+// uses, pinned to a single connection, with the same busy_timeout Runner
+// itself sets — so a status/verify run waits out a brief lock held by
+// another process (e.g. a concurrent apply) instead of failing immediately
+// with "database is locked".
 func openDB(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open database %s: %w", dbPath, err)
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout = %d", sqlitemigrate.BusyTimeoutMillis)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set busy_timeout on %s: %w", dbPath, err)
+	}
 	return db, nil
 }
 
-// readApplied reads dbPath's bookkeeping table. A database file that
-// doesn't exist yet, or one that hasn't been migrated yet, both report no
-// applied migrations — without ever opening a connection when the file is
-// missing, so inspecting a not-yet-created target never creates it as a
-// side effect.
-func readApplied(ctx context.Context, dbPath string) (map[string]appliedMigration, error) {
-	if _, err := os.Stat(dbPath); err != nil {
-		if os.IsNotExist(err) {
-			return map[string]appliedMigration{}, nil
-		}
-		return nil, fmt.Errorf("stat database %s: %w", dbPath, err)
-	}
-
-	db, err := openDB(dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = db.Close() }()
-
-	var tableCount int
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, bookkeepingTable,
-	).Scan(&tableCount); err != nil {
-		return nil, fmt.Errorf("check bookkeeping table: %w", err)
-	}
-	if tableCount == 0 {
-		return map[string]appliedMigration{}, nil
-	}
-
-	rows, err := db.QueryContext(ctx, `SELECT version, checksum, applied_at FROM `+bookkeepingTable)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", bookkeepingTable, err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	applied := make(map[string]appliedMigration)
-	for rows.Next() {
-		var version string
-		var a appliedMigration
-		if err := rows.Scan(&version, &a.Checksum, &a.AppliedAt); err != nil {
-			return nil, fmt.Errorf("scan %s row: %w", bookkeepingTable, err)
-		}
-		applied[version] = a
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read %s: %w", bookkeepingTable, err)
-	}
-	return applied, nil
-}
-
-// pendingMigrations reports which of migrations aren't yet recorded in
-// applied, enforcing the same immutability checks Runner.Apply itself
-// performs before running anything: a recorded migration whose checksum no
-// longer matches its file, or one with no matching file at all, is refused
-// rather than silently skipped, so a dry run never predicts success for a
-// run that would actually be rejected.
-func pendingMigrations(migrations []sqlitemigrate.Migration, applied map[string]appliedMigration) ([]sqlitemigrate.Migration, error) {
-	var pending []sqlitemigrate.Migration
-	seen := make(map[string]bool, len(migrations))
-	for _, m := range migrations {
-		seen[m.Version] = true
-		rec, ok := applied[m.Version]
-		if !ok {
-			pending = append(pending, m)
-			continue
-		}
-		if rec.Checksum != m.Checksum {
-			return nil, &sqlitemigrate.ChecksumMismatchError{Version: m.Version, Want: rec.Checksum, Got: m.Checksum}
-		}
-	}
-	for version := range applied {
-		if !seen[version] {
-			return nil, &sqlitemigrate.MissingMigrationError{Version: version}
-		}
-	}
-	return pending, nil
+// readApplied reports dbPath's applied migrations through Runner.Applied,
+// so the CLI never needs its own copy of the bookkeeping table's name or
+// schema.
+func readApplied(ctx context.Context, dbPath string) ([]sqlitemigrate.AppliedMigration, error) {
+	runner := &sqlitemigrate.Runner{DBPath: dbPath}
+	return runner.Applied(ctx)
 }

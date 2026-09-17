@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+
+	sqlitemigrate "github.com/mdg-labs/sqlite-migrate"
 )
 
 // RunStatus is the CLI entry point for `sqlite-migrate status`.
@@ -35,10 +37,14 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	applied, err := readApplied(ctx, dbPath)
+	appliedList, err := readApplied(ctx, dbPath)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "status: %v\n", err)
 		return 1
+	}
+	applied := make(map[string]sqlitemigrate.AppliedMigration, len(appliedList))
+	for _, a := range appliedList {
+		applied[a.Version] = a
 	}
 
 	if len(migrations) == 0 && len(applied) == 0 {
