@@ -257,11 +257,14 @@ func asciiLower(s string) string {
 func normalizeSQL(sql string) string {
 	tokens := sqlTokens(sql)
 	foldIdentifierPositions(tokens)
-	texts := make([]string, len(tokens))
+	var b strings.Builder
 	for i, tok := range tokens {
-		texts[i] = tok.text
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(tok.text)
 	}
-	return strings.Join(texts, " ")
+	return b.String()
 }
 
 // sqlToken is one token of sqlTokens' output. quoted is set only for a
@@ -357,30 +360,52 @@ var tableConstraintKeywords = map[string]bool{
 }
 
 // foldIdentifierPositions folds the case of quoted tokens that sit where
-// SQLite's grammar requires an identifier — a CREATE TABLE's own table
-// name, and each column's name at the start of its definition — since
-// SQLite identifiers compare case-insensitively there regardless of
-// quoting style. It leaves every other token, quoted or not, untouched:
-// in particular the contents of a CHECK, DEFAULT or GENERATED expression,
-// where a double-quoted token still might be a DQS string literal whose
-// case is a genuine change.
+// SQLite's grammar requires an identifier — a CREATE TABLE/INDEX's own
+// name, each column's name at the start of its definition, a foreign key's
+// REFERENCES target table, and a CREATE INDEX's ON table — since SQLite
+// identifiers compare case-insensitively there regardless of quoting
+// style, and SQLite double-quotes exactly these positions when it rewrites
+// a dependent object's stored SQL after a rename. It leaves every other
+// token, quoted or not, untouched: in particular the contents of a CHECK,
+// DEFAULT or GENERATED expression, where a double-quoted token still might
+// be a DQS string literal whose case is a genuine change.
 func foldIdentifierPositions(tokens []sqlToken) {
 	n := len(tokens)
-	i := 0
-	for i < n && tokens[i].text != "create" {
-		i++
-	}
-	if i >= n {
+	if n == 0 || tokens[0].text != "create" {
 		return
 	}
-	i++
+	i := 1
 	for i < n && (tokens[i].text == "temp" || tokens[i].text == "temporary") {
 		i++
 	}
-	if i >= n || tokens[i].text != "table" {
-		return
+	if i < n && tokens[i].text == "unique" {
+		i++
 	}
-	i++
+	switch {
+	case i < n && tokens[i].text == "table":
+		foldCreateTableIdentifiers(tokens, i+1)
+	case i < n && tokens[i].text == "index":
+		foldCreateIndexIdentifiers(tokens, i+1)
+	}
+}
+
+// foldIdentifier folds tokens[i]'s case if it was unwrapped from a
+// double-quoted run. SQLite's CREATE TABLE/INDEX grammar never allows a
+// schema-qualified name (main.foo) in any of the positions this file folds
+// — verified against SQLite directly, which rejects it as a syntax error
+// in every one of them — so there is never more than this one token to
+// consider.
+func foldIdentifier(tokens []sqlToken, i int) {
+	if i < len(tokens) && tokens[i].quoted {
+		tokens[i].text = asciiLower(tokens[i].text)
+	}
+}
+
+// foldCreateTableIdentifiers folds the table's own name, each column's
+// name, and the REFERENCES target of every foreign key (column-level or
+// table-level). i is the token index just after the TABLE keyword.
+func foldCreateTableIdentifiers(tokens []sqlToken, i int) {
+	n := len(tokens)
 	if i+2 < n && tokens[i].text == "if" && tokens[i+1].text == "not" && tokens[i+2].text == "exists" {
 		i += 3
 	}
@@ -388,16 +413,8 @@ func foldIdentifierPositions(tokens []sqlToken) {
 		return
 	}
 
-	nameIdx := i
-	if i+2 < n && tokens[i+1].text == "." {
-		nameIdx = i + 2
-		i += 3
-	} else {
-		i++
-	}
-	if nameIdx < n && tokens[nameIdx].quoted {
-		tokens[nameIdx].text = asciiLower(tokens[nameIdx].text)
-	}
+	foldIdentifier(tokens, i)
+	i++
 
 	for i < n && tokens[i].text != "(" {
 		i++
@@ -421,6 +438,9 @@ func foldIdentifierPositions(tokens []sqlToken) {
 			if depth == 1 {
 				atFieldStart = true
 			}
+		case "references":
+			foldIdentifier(tokens, i+1)
+			atFieldStart = false
 		default:
 			if depth == 1 && atFieldStart {
 				if tokens[i].quoted && !tableConstraintKeywords[tokens[i].text] {
@@ -431,4 +451,25 @@ func foldIdentifierPositions(tokens []sqlToken) {
 		}
 		i++
 	}
+}
+
+// foldCreateIndexIdentifiers folds the index's own name and its ON table.
+// i is the token index just after the INDEX keyword.
+func foldCreateIndexIdentifiers(tokens []sqlToken, i int) {
+	n := len(tokens)
+	if i+2 < n && tokens[i].text == "if" && tokens[i+1].text == "not" && tokens[i+2].text == "exists" {
+		i += 3
+	}
+	if i >= n {
+		return
+	}
+
+	foldIdentifier(tokens, i)
+	i++
+
+	if i >= n || tokens[i].text != "on" {
+		return
+	}
+	i++
+	foldIdentifier(tokens, i)
 }

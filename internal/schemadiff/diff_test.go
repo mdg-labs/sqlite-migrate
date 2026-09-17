@@ -456,6 +456,50 @@ func TestDiff_SQLChanged_RebuiltMixedCaseTableNoFalsePositive(t *testing.T) {
 	}
 }
 
+// TestDiff_SQLChanged_RebuiltTableFKReferenceNoFalsePositive replays what
+// SQLite actually does to a dependent table's stored SQL when the table it
+// references is rebuilt: rebuilding "Users" quotes every REFERENCES Users
+// in sqlite_master, turning it into REFERENCES "Users", even though
+// "orders" itself never changed. Diffing that against the plain schema.sql
+// form must come back empty — verified directly against sqlite3 (rename
+// Users to a suffixed name and back, per the standard rebuild pattern).
+func TestDiff_SQLChanged_RebuiltTableFKReferenceNoFalsePositive(t *testing.T) {
+	rebuilt := mustParse(t, `
+		CREATE TABLE "Users" (id INTEGER PRIMARY KEY) STRICT;
+		CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES "Users"(id)) STRICT;
+	`)
+	after := mustParse(t, `
+		CREATE TABLE Users (id INTEGER PRIMARY KEY) STRICT;
+		CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES Users(id)) STRICT;
+	`)
+
+	d := Diff(rebuilt, after)
+	if !d.Empty() {
+		t.Fatalf("want no diff for a rebuilt FK-referenced table's quoted REFERENCES clause, got %+v", d)
+	}
+}
+
+// TestDiff_SQLChanged_RebuiltTableIndexReferenceNoFalsePositive is the
+// index analog: rebuilding the indexed table itself quotes that table's
+// name in the index's own stored ON clause (verified directly against
+// sqlite3), which must not make diffIndexes see the index as both removed
+// and added.
+func TestDiff_SQLChanged_RebuiltTableIndexReferenceNoFalsePositive(t *testing.T) {
+	rebuilt := mustParse(t, `
+		CREATE TABLE "Orders" (id INTEGER PRIMARY KEY, user_id INTEGER) STRICT;
+		CREATE INDEX idx_orders_user ON "Orders"(user_id);
+	`)
+	after := mustParse(t, `
+		CREATE TABLE Orders (id INTEGER PRIMARY KEY, user_id INTEGER) STRICT;
+		CREATE INDEX idx_orders_user ON Orders(user_id);
+	`)
+
+	d := Diff(rebuilt, after)
+	if !d.Empty() {
+		t.Fatalf("want no diff for a rebuilt table's quoted CREATE INDEX ON clause, got %+v", d)
+	}
+}
+
 func TestDiff_Destructive_ColumnDroppedAmongCaseOnlyRenames(t *testing.T) {
 	before := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, Email TEXT, Nickname TEXT) STRICT;`)
 	after := mustParse(t, `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT) STRICT;`)
