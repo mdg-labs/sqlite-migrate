@@ -15,7 +15,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -203,31 +202,42 @@ func syncFile(path string) error {
 	return nil
 }
 
-// newSnapshotNamePattern matches names built by the current snapshotName: a
-// fixed-width, zero-padded nanosecond timestamp with no attempt suffix.
-var newSnapshotNamePattern = regexp.MustCompile(`\.([0-9]{20})\.snapshot$`)
+// newSnapshotNamePattern matches names built by the current snapshotName for
+// dbFile: a fixed-width, zero-padded nanosecond timestamp with no attempt
+// suffix. Anchored on dbFile's exact base name, not just checked as a
+// prefix — a bare prefix test would let pruning for "app" match and delete
+// "app.db"'s snapshots whenever the two share a SnapshotDir.
+func newSnapshotNamePattern(dbFile string) *regexp.Regexp {
+	return regexp.MustCompile(`^` + regexp.QuoteMeta(filepath.Base(dbFile)) + `\.([0-9]{20})\.snapshot$`)
+}
 
 // oldSnapshotNamePattern matches names built by the one-second-resolution
 // scheme this replaces, with its optional numeric attempt suffix
 // ("...-10.snapshot" vs "...-2.snapshot") — still present on disk in any
-// directory that has snapshots from before an upgrade.
-var oldSnapshotNamePattern = regexp.MustCompile(`\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+// directory that has snapshots from before an upgrade. Anchored the same
+// way as newSnapshotNamePattern, for the same reason.
+func oldSnapshotNamePattern(dbFile string) *regexp.Regexp {
+	return regexp.MustCompile(`^` + regexp.QuoteMeta(filepath.Base(dbFile)) + `\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+}
 
-// snapshotFileAge parses a snapshot filename built by either the current or
-// the previous naming scheme into a nanosecond value usable only to order
-// snapshots relative to each other, not as a real timestamp: an old-format
-// name's attempt suffix (bounded well under a second's worth of
-// nanoseconds) is folded in as a sub-second tiebreaker so files from the
-// same one-second bucket still sort in the order they were reserved.
-func snapshotFileAge(name string) (int64, bool) {
-	if m := newSnapshotNamePattern.FindStringSubmatch(name); m != nil {
+// snapshotFileAge parses name against newPattern/oldPattern (dbFile's own
+// patterns from newSnapshotNamePattern/oldSnapshotNamePattern) into a
+// nanosecond value usable only to order snapshots relative to each other,
+// not as a real timestamp: an old-format name's attempt suffix (bounded
+// well under a second's worth of nanoseconds) is folded in as a sub-second
+// tiebreaker so files from the same one-second bucket still sort in the
+// order they were reserved. A name that doesn't belong to dbFile at all —
+// including another database's, in a shared SnapshotDir — matches neither
+// pattern.
+func snapshotFileAge(newPattern, oldPattern *regexp.Regexp, name string) (int64, bool) {
+	if m := newPattern.FindStringSubmatch(name); m != nil {
 		ns, err := strconv.ParseInt(m[1], 10, 64)
 		if err != nil {
 			return 0, false
 		}
 		return ns, true
 	}
-	if m := oldSnapshotNamePattern.FindStringSubmatch(name); m != nil {
+	if m := oldPattern.FindStringSubmatch(name); m != nil {
 		t, err := time.Parse(snapshotTimestampLayout, m[1])
 		if err != nil {
 			return 0, false
@@ -249,11 +259,13 @@ func pruneSnapshots(dbPath, dir string, retain int) error {
 		return nil
 	}
 
-	pattern := snapshotNamePattern(dbPath)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("sqlitemigrate: list snapshot directory %q: %w", dir, err)
 	}
+
+	newPattern := newSnapshotNamePattern(dbPath)
+	oldPattern := oldSnapshotNamePattern(dbPath)
 
 	type snapshotFile struct {
 		name string
@@ -266,7 +278,7 @@ func pruneSnapshots(dbPath, dir string, retain int) error {
 		if e.IsDir() {
 			continue
 		}
-		age, ok := snapshotFileAge(name)
+		age, ok := snapshotFileAge(newPattern, oldPattern, name)
 		if !ok {
 			continue
 		}

@@ -158,7 +158,7 @@ func TestSnapshot_ConcurrentCallsAllSucceedWithDistinctNames(t *testing.T) {
 			t.Fatalf("Snapshot call %d returned duplicate path %q", i, paths[i])
 		}
 		seen[paths[i]] = true
-		if !newSnapshotNamePattern.MatchString(filepath.Base(paths[i])) {
+		if !newSnapshotNamePattern(dbPath).MatchString(filepath.Base(paths[i])) {
 			t.Errorf("Snapshot call %d returned name %q not in the collision-free nanosecond format; it must have needed the attempt-retry fallback", i, filepath.Base(paths[i]))
 		}
 	}
