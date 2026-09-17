@@ -15,7 +15,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -178,12 +177,17 @@ func syncFile(path string) error {
 	return nil
 }
 
-// snapshotNamePattern parses a name built by snapshotName back into its
-// timestamp and attempt, so pruneSnapshots can order snapshots by age
-// numerically instead of lexicographically — a plain string sort puts
+// snapshotNamePattern parses a name built by snapshotName for dbFile back
+// into its timestamp and attempt, so pruneSnapshots can order snapshots by
+// age numerically instead of lexicographically — a plain string sort puts
 // "...-10.snapshot" before "...-2.snapshot" once double-digit attempts
-// appear.
-var snapshotNamePattern = regexp.MustCompile(`\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+// appear. It is anchored on the whole base name, not just a prefix: a bare
+// prefix test ("app." as a prefix of "app.db.<ts>.snapshot") would let
+// pruning for one database delete another database's snapshots whenever one
+// base name is a dotted prefix of the other's in a shared SnapshotDir.
+func snapshotNamePattern(dbFile string) *regexp.Regexp {
+	return regexp.MustCompile(`^` + regexp.QuoteMeta(filepath.Base(dbFile)) + `\.([0-9]{14})(?:-([0-9]+))?\.snapshot$`)
+}
 
 // pruneSnapshots removes the oldest snapshot files for dbPath in dir until
 // at most retain remain. retain <= 0 disables pruning: every snapshot is
@@ -193,7 +197,7 @@ func pruneSnapshots(dbPath, dir string, retain int) error {
 		return nil
 	}
 
-	prefix := filepath.Base(dbPath) + "."
+	pattern := snapshotNamePattern(dbPath)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("sqlitemigrate: list snapshot directory %q: %w", dir, err)
@@ -208,10 +212,10 @@ func pruneSnapshots(dbPath, dir string, retain int) error {
 	var files []snapshotFile
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".snapshot") {
+		if e.IsDir() {
 			continue
 		}
-		m := snapshotNamePattern.FindStringSubmatch(name)
+		m := pattern.FindStringSubmatch(name)
 		if m == nil {
 			continue
 		}

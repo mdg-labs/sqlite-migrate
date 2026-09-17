@@ -214,3 +214,42 @@ func TestSnapshot_PrunesByNumericAttemptNotLexicographicOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshot_PruneDoesNotCrossDatabasesSharingASnapshotDir(t *testing.T) {
+	dir := t.TempDir()
+	snapshotDir := filepath.Join(dir, "snapshots")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatalf("mkdir snapshot dir: %v", err)
+	}
+
+	// "app" is a dotted prefix of "app.db": a bare filepath.Base(dbPath)+"."
+	// HasPrefix test on "app.db.20200101000000.snapshot" is satisfied by
+	// "app." just as much as it is by "app.db.", so pruning for "app" must
+	// not be able to see, let alone delete, snapshots that belong to
+	// "app.db".
+	shortDB := filepath.Join(dir, "app")
+	longDB := filepath.Join(dir, "app.db")
+
+	// longSnapshot is the older file: under the bug, both files match "app."
+	// as a prefix, so with retain=1 the merged, age-sorted list has 2
+	// entries and the oldest — longSnapshot, another database's only
+	// backup — is the one pruning removes.
+	longSnapshot := filepath.Join(snapshotDir, filepath.Base(longDB)+".20200101000000.snapshot")
+	shortSnapshot := filepath.Join(snapshotDir, filepath.Base(shortDB)+".20210101000000.snapshot")
+	for _, p := range []string{longSnapshot, shortSnapshot} {
+		if err := os.WriteFile(p, []byte("placeholder"), 0o644); err != nil {
+			t.Fatalf("seed snapshot file %q: %v", p, err)
+		}
+	}
+
+	if err := pruneSnapshots(shortDB, snapshotDir, 1); err != nil {
+		t.Fatalf("pruneSnapshots: %v", err)
+	}
+
+	if _, err := os.Stat(longSnapshot); err != nil {
+		t.Errorf("longDB's snapshot %q was pruned by a call for shortDB: %v", longSnapshot, err)
+	}
+	if _, err := os.Stat(shortSnapshot); err != nil {
+		t.Errorf("shortDB's own retained snapshot %q missing: %v", shortSnapshot, err)
+	}
+}
