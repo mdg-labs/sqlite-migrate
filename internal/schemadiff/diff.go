@@ -3,6 +3,8 @@ package schemadiff
 import (
 	"sort"
 	"strings"
+
+	"github.com/mdg-labs/sqlite-migrate/internal/sqlident"
 )
 
 // SchemaDiff is the set of table/column/index/foreign-key differences
@@ -291,16 +293,16 @@ func sqlTokens(s string) []string {
 				i += j + 4
 			}
 		case c == '\'':
-			j := scanQuoted(s, i, '\'')
+			j := sqlident.ScanQuoted(s, i, '\'')
 			tokens = append(tokens, s[i:j])
 			i = j
 		case c == '"':
-			j := scanQuoted(s, i, c)
-			tokens = append(tokens, unquote(s[i:j], c))
+			j := sqlident.ScanQuoted(s, i, c)
+			tokens = append(tokens, sqlident.Unquote(s[i:j], c))
 			i = j
 		case c == '`':
-			j := scanQuoted(s, i, c)
-			tokens = append(tokens, asciiLower(unquote(s[i:j], c)))
+			j := sqlident.ScanQuoted(s, i, c)
+			tokens = append(tokens, asciiLower(sqlident.Unquote(s[i:j], c)))
 			i = j
 		case c == '[':
 			j := strings.IndexByte(s[i:], ']')
@@ -311,9 +313,9 @@ func sqlTokens(s string) []string {
 				tokens = append(tokens, asciiLower(s[i+1:i+j]))
 				i += j + 1
 			}
-		case isIdentByte(c):
+		case sqlident.IsIdentByte(c):
 			j := i + 1
-			for j < n && isIdentByte(s[j]) {
+			for j < n && sqlident.IsIdentByte(s[j]) {
 				j++
 			}
 			tokens = append(tokens, asciiLower(s[i:j]))
@@ -324,38 +326,4 @@ func sqlTokens(s string) []string {
 		}
 	}
 	return tokens
-}
-
-// scanQuoted returns the index just past the end of a quoted run starting
-// at s[start] (which holds the opening quote char), honoring the SQL
-// convention that a doubled quote char is an escaped literal quote inside
-// the run rather than its terminator.
-func scanQuoted(s string, start int, quote byte) int {
-	n := len(s)
-	j := start + 1
-	for j < n {
-		if s[j] == quote {
-			if j+1 < n && s[j+1] == quote {
-				j += 2
-				continue
-			}
-			return j + 1
-		}
-		j++
-	}
-	return n
-}
-
-// unquote strips a quoted run's opening/closing quote chars and collapses
-// any doubled quote char inside it back to one.
-func unquote(s string, quote byte) string {
-	inner := s
-	if len(inner) >= 2 && inner[0] == quote && inner[len(inner)-1] == quote {
-		inner = inner[1 : len(inner)-1]
-	}
-	return strings.ReplaceAll(inner, string(quote)+string(quote), string(quote))
-}
-
-func isIdentByte(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
