@@ -1,0 +1,78 @@
+name: Enhancement
+description: Propose a new feature or an improvement to existing behavior.
+title: "feat: "
+labels:
+  - feat
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an enhancement. Focus on the problem first —
+        the right solution is often clearer once the problem is well stated.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What can't you do today with sqlite-migrate, and why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like to see, in enough detail to evaluate.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, workarounds, or prior art you looked at.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area (best guess)
+      description: Helps triage route this — pick "Not sure" if you don't know.
+      options:
+        - "schemadiff — internal/schemadiff/"
+        - "rebuild — internal/rebuild/"
+        - "rename — internal/rename/"
+        - "sqldefwrap — internal/sqldefwrap/"
+        - "runtime — migration.go, runner.go, snapshot.go, drift.go, checksum.go"
+        - "cli — cmd/sqlite-migrate/"
+        - "docs — README.md, docs/"
+        - "ci — .github/workflows/, Makefile"
+        - "skill — skills/sqlite-migrate/"
+        - "Not sure"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: data_loss
+    attributes:
+      label: Data-loss / destructive-path risk?
+      description: >-
+        Would this touch the destructive-vs-safe classifier, the rebuild
+        generator, the backup/restore (`VACUUM INTO`) path, checksum
+        verification, or the replay-based drift check — anywhere a bug could
+        silently lose or corrupt a database?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else worth knowing — links, screenshots, related issues.
+    validations:
+      required: false
