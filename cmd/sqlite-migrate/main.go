@@ -13,16 +13,24 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: sqlite-migrate <command> [flags]")
-		fmt.Fprintln(os.Stderr, "available commands: generate")
+		fmt.Fprintln(os.Stderr, "available commands: generate, apply, check, verify, status")
 		os.Exit(2)
 	}
 
 	switch os.Args[1] {
 	case "generate":
 		os.Exit(RunGenerate(os.Args[2:], os.Stdin, os.Stdout, os.Stderr, time.Now))
+	case "apply":
+		os.Exit(RunApply(os.Args[2:], os.Stdout, os.Stderr))
+	case "check":
+		os.Exit(RunCheck(os.Args[2:], os.Stdout, os.Stderr))
+	case "verify":
+		os.Exit(RunVerify(os.Args[2:], os.Stdout, os.Stderr))
+	case "status":
+		os.Exit(RunStatus(os.Args[2:], os.Stdout, os.Stderr))
 	default:
 		fmt.Fprintf(os.Stderr, "sqlite-migrate: unknown command %q\n", os.Args[1])
-		fmt.Fprintln(os.Stderr, "available commands: generate")
+		fmt.Fprintln(os.Stderr, "available commands: generate, apply, check, verify, status")
 		os.Exit(2)
 	}
 }
