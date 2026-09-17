@@ -3,7 +3,10 @@ package schemadiff
 // Scenario numbers in test names refer to the Testing & Verification
 // Strategy scenario matrix in the spec doc.
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func findTableDiff(t *testing.T, d *SchemaDiff, name string) TableDiff {
 	t.Helper()
@@ -511,5 +514,42 @@ func TestDiff_Destructive_ColumnDroppedAmongCaseOnlyRenames(t *testing.T) {
 	}
 	if c := Classify(d); c.Verdict != Destructive {
 		t.Fatalf("want a genuine column drop to still classify Destructive, got %v (%+v)", c.Verdict, c)
+	}
+}
+
+// TestSQLTokens_NonASCIIIdentifierIsSingleToken reproduces scenario 19: a
+// byte with the high bit set is part of a multi-byte UTF-8 identifier
+// character, which SQLite's own tokenizer accepts unquoted (verified
+// directly against sqlite3: CREATE TABLE t (café INTEGER) is accepted with
+// café unquoted). Before the fix, sqlTokens fell through to its
+// single-character default case for every such byte, since
+// sqlident.IsIdentByte only recognizes ASCII identifier bytes — splitting
+// "café" into "caf", then two more garbled single-byte tokens ("Ã", "©")
+// built by converting each raw UTF-8 continuation byte back to a rune,
+// instead of keeping the identifier fused into one token.
+func TestSQLTokens_NonASCIIIdentifierIsSingleToken(t *testing.T) {
+	toks := sqlTokens(`CREATE TABLE t (café INTEGER) STRICT;`)
+	var got []string
+	for _, tok := range toks {
+		got = append(got, tok.text)
+	}
+	want := []string{"create", "table", "t", "(", "café", "integer", ")", "strict", ";"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("sqlTokens(...) = %v, want %v", got, want)
+	}
+}
+
+// TestDiff_SQLChanged_NonASCIIIdentifierGenuineChangeDetected is scenario
+// 19's Diff-level regression: a CHECK constraint change on a non-ASCII
+// column is invisible to PRAGMA introspection, so SQLChanged (via
+// normalizeSQL/sqlTokens) is the only signal that catches it — the same
+// path TestSQLTokens_NonASCIIIdentifierIsSingleToken exercises directly.
+func TestDiff_SQLChanged_NonASCIIIdentifierGenuineChangeDetected(t *testing.T) {
+	before := mustParse(t, `CREATE TABLE t (café INTEGER) STRICT;`)
+	after := mustParse(t, `CREATE TABLE t (café INTEGER CHECK (café > 0)) STRICT;`)
+
+	td := findTableDiff(t, Diff(before, after), "t")
+	if !td.SQLChanged {
+		t.Fatal("want a genuine CHECK constraint change on a non-ASCII column to still register as SQLChanged")
 	}
 }

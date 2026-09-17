@@ -57,6 +57,17 @@ func TestRenameCreateTableSQL(t *testing.T) {
 			newer: "bücher_new",
 			want:  `CREATE TABLE "bücher_new" (id INTEGER PRIMARY KEY) STRICT`,
 		},
+		{
+			// Found by Phase 8 fuzzing: '$' is a valid identifier byte to
+			// SQLite (verified directly: CREATE TABLE foo$bar is accepted
+			// unquoted), but wasn't to isIdentByte, so scanIdentifier
+			// stopped at "foo" and spliced the new name in mid-identifier,
+			// leaving "$bar(...)" as unparseable trailing garbage.
+			name:  "bare identifier containing a dollar sign",
+			sql:   "CREATE TABLE foo$bar (id INTEGER PRIMARY KEY) STRICT",
+			newer: "foo$bar_new",
+			want:  `CREATE TABLE "foo$bar_new" (id INTEGER PRIMARY KEY) STRICT`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,6 +99,19 @@ func TestReferencesTable(t *testing.T) {
 				t.Errorf("referencesTable(%q, items) = %v, want %v", tc.sql, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReferencesTable_EmptyTableNameDoesNotPanic reproduces a bug found by
+// Phase 8 fuzzing: containsIdentifierWord's bare-word scan never terminated
+// for an empty needle (strings.Index always matches an empty substring, at
+// every position, without bound), eventually panicking on an out-of-range
+// slice. An empty table name is unusual but valid to SQLite
+// (CREATE TABLE "" (...) is accepted), so referencesTable must handle it
+// without panicking regardless of what sql it's asked to search.
+func TestReferencesTable_EmptyTableNameDoesNotPanic(t *testing.T) {
+	if got := referencesTable("SELECT * FROM items", ""); got {
+		t.Errorf(`referencesTable(..., "") = true, want false`)
 	}
 }
 
@@ -178,6 +202,18 @@ func TestLoadCatalog(t *testing.T) {
 	}
 	if len(cat.views) != 1 || cat.views[0].name != "items_view" {
 		t.Fatalf("want one view, got %+v", cat.views)
+	}
+}
+
+// TestLoadCatalog_RejectsSchemaContainingNULByte is loadCatalog's analog of
+// schemadiff.TestParse_RejectsSchemaContainingNULByte: modernc.org/sqlite
+// silently stops executing at the first NUL byte with no error at all, so
+// without this guard a trigger or view declared after one would vanish
+// from the catalog without a trace.
+func TestLoadCatalog_RejectsSchemaContainingNULByte(t *testing.T) {
+	schemaSQL := "CREATE TABLE items (id INTEGER PRIMARY KEY) STRICT;\x00CREATE VIEW items_view AS SELECT id FROM items;"
+	if _, err := loadCatalog(context.Background(), schemaSQL, nil); err == nil {
+		t.Fatal("want error for schema SQL containing a NUL byte, got nil")
 	}
 }
 
