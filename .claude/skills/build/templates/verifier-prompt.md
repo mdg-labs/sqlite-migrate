@@ -53,6 +53,13 @@ With more than one commit, check the **split** as part of layer 2: each
 commit holds only its own item's files and only its own `Fixes #`/`Refs #`
 trailer.
 
+## Known escapes — read first
+
+`WORKSPACE/.claude/skills/build/templates/known-escapes.md` lists the
+defect patterns that passed this verification before and were then found
+by CodeRabbit. Read it before reviewing, and check each commit against
+every pattern that applies to the files it touches (layer 6).
+
 ## Six layers — review each item's commit against all of them
 
 1. **Correctness / compilation.** Run every check that applies, yourself —
