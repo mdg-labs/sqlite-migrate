@@ -483,3 +483,18 @@ func TestExprMasker_UnmaskErrorsOnUnresolvedPlaceholder(t *testing.T) {
 		t.Fatalf("want the error to name the placeholder, got: %v", err)
 	}
 }
+
+func TestExprMasker_UnmaskErrorsOnPlaceholderInQuotedOrCommentElement(t *testing.T) {
+	m := newExprMasker("")
+	ph := m.placeholderFor("a GLOB 'x*'")
+	for _, ddl := range []string{
+		fmt.Sprintf("ALTER TABLE t ADD COLUMN b TEXT CHECK ('%s')", ph),
+		fmt.Sprintf(`ALTER TABLE t ADD COLUMN b TEXT CHECK ("%s")`, ph),
+		fmt.Sprintf("-- skipped: CHECK (%s)", ph),
+		fmt.Sprintf("ALTER TABLE t ADD COLUMN b TEXT /* %s */", ph),
+	} {
+		if _, err := m.unmask([]string{ddl}); err == nil {
+			t.Errorf("want an error for a placeholder outside a bare identifier in %q", ddl)
+		}
+	}
+}

@@ -86,10 +86,12 @@ func (m *exprMasker) mask(sql string) string {
 
 // unmask restores every placeholder this masker minted to its original
 // expression body text in each of ddls. It returns an error instead of a
-// statement if a bare identifier shaped like this masker's placeholders
-// appears without a matching body — meaning a placeholder reached
-// sqldef's output somewhere this masker didn't expect to find or restore
-// it, which must never be allowed to reach a migration file unexplained.
+// statement if this masker's nonce appears anywhere else — an unknown
+// bare identifier, or inside a quoted string/identifier or a comment.
+// newExprMasker guarantees the nonce is absent from every input, so any
+// such occurrence means a placeholder reached sqldef's output somewhere
+// this masker didn't expect to find or restore it, which must never be
+// allowed to reach a migration file unexplained.
 func (m *exprMasker) unmask(ddls []string) ([]string, error) {
 	out := make([]string, len(ddls))
 	for i, ddl := range ddls {
@@ -106,13 +108,14 @@ func (m *exprMasker) unmaskOne(ddl string) (string, error) {
 	els := tokenizeForKeywordQuoting(ddl)
 	var b strings.Builder
 	for _, el := range els {
-		if el.kind == "ident" && strings.HasPrefix(el.text, m.nonce) {
-			body, ok := m.bodies[el.text]
-			if !ok {
-				return "", fmt.Errorf("sqldefwrap: unresolved expression placeholder %q in generated DDL %q", el.text, ddl)
+		if el.kind == "ident" {
+			if body, ok := m.bodies[el.text]; ok {
+				b.WriteString(body)
+				continue
 			}
-			b.WriteString(body)
-			continue
+		}
+		if strings.Contains(el.text, m.nonce) {
+			return "", fmt.Errorf("sqldefwrap: unresolved expression placeholder %q in generated DDL %q", el.text, ddl)
 		}
 		b.WriteString(el.text)
 	}
