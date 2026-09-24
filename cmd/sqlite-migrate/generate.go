@@ -425,9 +425,11 @@ func needsRebuild(ctx context.Context, td schemadiff.TableDiff) (rebuildDecision
 
 // additiveChangeReproducesAfter reports whether generating and applying
 // sqldef's additive statements for td's own before/after CREATE TABLE text,
-// replayed alongside td.Before's own explicit indexes so both sides of the
-// comparison carry the same index set, reproduces the desired table
-// exactly. This is the only reliable way to tell a table whose CREATE
+// followed by td.After's own explicit indexes so both sides of the
+// comparison carry the same index set (buildMigrationBody emits the
+// explicit index changes separately, and a target index may reference an
+// added column, so they replay after the ADD statements), reproduces the
+// desired table exactly. This is the only reliable way to tell a table whose CREATE
 // TABLE text changed purely because of its added columns apart from one
 // that picked up an untracked CHECK/COLLATE/GENERATED change in the same
 // schema.sql edit: neither case is distinguishable from
@@ -437,7 +439,25 @@ func needsRebuild(ctx context.Context, td schemadiff.TableDiff) (rebuildDecision
 // uses for the whole migration. When it returns false, reason explains why
 // for the stderr note buildMigrationBody attaches to the resulting
 // rebuild.
+//
+// The scratch replay's table is empty, and SQLite only rejects an ADD
+// COLUMN with a non-constant DEFAULT (CURRENT_TIMESTAMP, a function call,
+// GLOB/MATCH, …) when the table has rows, so each added column's DEFAULT
+// is first probed against a one-row table: one the real database would
+// reject there routes the table to a rebuild instead.
 func additiveChangeReproducesAfter(ctx context.Context, td schemadiff.TableDiff) (ok bool, reason string, err error) {
+	for _, c := range td.AddedColumns {
+		if !c.HasDefault {
+			continue
+		}
+		probe := fmt.Sprintf("CREATE TABLE _sqlite_migrate_probe_ (x INTEGER) STRICT;\n"+
+			"INSERT INTO _sqlite_migrate_probe_ VALUES (1);\n"+
+			"ALTER TABLE _sqlite_migrate_probe_ ADD COLUMN c ANY DEFAULT (%s);", c.DefaultValue)
+		if _, err := schemadiff.Parse(ctx, probe); err != nil {
+			return false, fmt.Sprintf("added column %q has a DEFAULT that ALTER TABLE ADD COLUMN rejects on a non-empty table", c.Name), nil
+		}
+	}
+
 	ddls, err := sqldefwrap.New().Diff(td.After.SQL, td.Before.SQL)
 	if err != nil {
 		return false, "", fmt.Errorf("sqldefwrap: %w", err)
@@ -448,12 +468,12 @@ func additiveChangeReproducesAfter(ctx context.Context, td schemadiff.TableDiff)
 	}
 
 	parts := []string{strings.TrimRight(td.Before.SQL, "; \t\n") + ";"}
-	for _, idx := range td.Before.Indexes {
+	parts = append(parts, stmts...)
+	for _, idx := range td.After.Indexes {
 		if idx.Origin == "c" && idx.SQL != "" {
 			parts = append(parts, strings.TrimRight(idx.SQL, "; \t\n")+";")
 		}
 	}
-	parts = append(parts, stmts...)
 
 	replayed, err := schemadiff.Parse(ctx, strings.Join(parts, "\n"))
 	if err != nil {

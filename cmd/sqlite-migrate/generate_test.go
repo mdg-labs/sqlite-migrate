@@ -664,6 +664,101 @@ CREATE INDEX widgets_status_idx ON widgets (status);`)
 	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
 }
 
+// TestGenerate_ColumnAndIndexOnItAddedTogether covers adding a column and
+// an explicit CREATE INDEX on that new column in the same schema.sql edit:
+// additiveChangeReproducesAfter must replay the target index set (after
+// the ADD statements, since the index references the new column) rather
+// than the pre-change one, or the index difference alone reads as a
+// residual CREATE TABLE change and forces a needless rebuild.
+func TestGenerate_ColumnAndIndexOnItAddedTogether(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT
+) STRICT;`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT,
+    email TEXT
+) STRICT;
+CREATE INDEX widgets_email_idx ON widgets (email);`)
+
+	var stderr bytes.Buffer
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	body := readFileString(t, res.path)
+	if !strings.Contains(body, "ADD COLUMN email") {
+		t.Fatalf("expected a direct ADD COLUMN email statement, got:\n%s", body)
+	}
+	if strings.Contains(body, "_sqlite_migrate_new") {
+		t.Fatalf("expected a plain ADD COLUMN, not a rebuild, got:\n%s", body)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr note, got: %q", stderr.String())
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
+// TestGenerate_AddedColumnWithNonConstantDefaultRebuilds covers an added
+// column whose DEFAULT SQLite's ALTER TABLE ADD COLUMN only rejects once
+// the table has rows — both a SQLite-only operator sqldefwrap has to mask
+// (GLOB) and a plain CURRENT_TIMESTAMP. The empty scratch replay accepts
+// either, so without the one-row DEFAULT probe the migration would pass
+// verification and then fail against any real, populated database.
+func TestGenerate_AddedColumnWithNonConstantDefaultRebuilds(t *testing.T) {
+	for _, col := range []string{
+		`flag INTEGER DEFAULT ('a' GLOB 'b')`,
+		`created_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+	} {
+		t.Run(col, func(t *testing.T) {
+			_, schemaPath, migrationsDir := newProject(t)
+			opts := baseOptions(schemaPath, migrationsDir)
+
+			writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT
+) STRICT;`)
+			if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+				t.Fatalf("initial generate: %v", err)
+			}
+
+			writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT,
+    `+col+`
+) STRICT;`)
+
+			var stderr bytes.Buffer
+			res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			body := readFileString(t, res.path)
+			if strings.Contains(body, "ADD COLUMN") {
+				t.Fatalf("expected no ADD COLUMN for a non-constant DEFAULT, got:\n%s", body)
+			}
+			if !strings.Contains(body, "_sqlite_migrate_new") {
+				t.Fatalf("expected a full rebuild, got:\n%s", body)
+			}
+			if !strings.Contains(stderr.String(), "rejects on a non-empty table") {
+				t.Fatalf("expected a stderr note explaining the non-constant DEFAULT, got: %q", stderr.String())
+			}
+			assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+		})
+	}
+}
+
 // TestGenerate_ConflictingAssumeRenameFlags covers passing both
 // --assume-renames and --assume-no-renames when the diff has no rename
 // candidates at all (e.g. a plain added column): the conflict used to be
