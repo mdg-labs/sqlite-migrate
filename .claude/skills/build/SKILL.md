@@ -1,7 +1,7 @@
 ---
 name: build
 description: Autonomously implement and verify sqlite-migrate — either the next unbuilt phase(s) of the Development Roadmap (default), or a specific GitHub issue/epic number — using sonnet execution agents in isolated scratch clones, one independent verifier per attempt, landing a PASS as a pull request against `main` (never a direct push, never auto-merged). Parallelizes phases/issues with disjoint file scope, serializes overlapping ones. Use when asked to "build sqlite-migrate", "run the next phase", "work on issue #n", "implement epic #n", or "run the build skill".
-argument-hint: [phase-number | issue-number] (omit for "next unbuilt phase")
+argument-hint: '[phase-number | issue-number] (omit for "next unbuilt phase")'
 allowed-tools:
   - Read
   - Grep
@@ -9,6 +9,8 @@ allowed-tools:
   - Agent
   - AskUserQuestion
   - Bash
+metadata:
+  internal: true
 ---
 
 # build
