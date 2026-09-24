@@ -43,6 +43,21 @@ Either way you get a single, statically-linked `sqlite-migrate` binary —
 the SQLite driver (`modernc.org/sqlite`) is pure Go, so there's no cgo
 toolchain or system SQLite library to install alongside it.
 
+## Agent skill
+
+If you drive schema changes through an AI coding agent (Claude Code,
+Cursor, or any other agent the [`vercel-labs/skills`](https://github.com/vercel-labs/skills)
+CLI supports), install the `sqlite-migrate` skill so it runs `generate`,
+`check`, `apply`, `verify`, and `status` correctly and never reaches for
+`--allow-destructive` just to get past a refusal:
+
+```sh
+npx skills add mdg-labs/sqlite-migrate --skill sqlite-migrate
+```
+
+Read the skill itself on GitHub:
+[`skills/sqlite-migrate/SKILL.md`](https://github.com/mdg-labs/sqlite-migrate/blob/main/skills/sqlite-migrate/SKILL.md).
+
 ## Quickstart
 
 **1. Write `schema.sql`.** Every table must be declared `STRICT` — see

@@ -19,6 +19,17 @@ go install github.com/mdg-labs/sqlite-migrate/cmd/sqlite-migrate@latest
 This puts a `sqlite-migrate` binary on your `PATH` (assuming
 `$(go env GOPATH)/bin` is on it).
 
+## Agent skill
+
+If an AI coding agent (Claude Code, Cursor, etc.) drives schema changes in
+your project, install the [`sqlite-migrate` skill](skills/sqlite-migrate/SKILL.md)
+so it runs `generate`/`check`/`apply`/`verify`/`status` correctly and never
+passes `--allow-destructive` just to get past a refusal:
+
+```sh
+npx skills add mdg-labs/sqlite-migrate --skill sqlite-migrate
+```
+
 ## Quickstart
 
 Start from an empty directory and a `schema.sql`:
