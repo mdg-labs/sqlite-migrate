@@ -375,3 +375,111 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id
 		t.Fatalf("want an error naming the unsupported ADD CONSTRAINT/foreign key statement, got: %v", err)
 	}
 }
+
+// TestDiff_SQLiteOnlyExpressionOperators covers issue #53: sqldef's shared
+// multi-dialect grammar rejects several valid SQLite operators
+// (GLOB/MATCH/IS <expr>) in a CHECK/DEFAULT/GENERATED expression body,
+// which used to fail generate outright for any additive change to a table
+// containing one. Diff now masks a rejected body behind an opaque
+// placeholder before calling sqldef and restores it afterward, so the
+// additive change still succeeds — covering, across the five cases, each
+// of a column-level CHECK, a table-level CHECK, a DEFAULT (…) and a
+// GENERATED … AS (…).
+func TestDiff_SQLiteOnlyExpressionOperators(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+	}{
+		{
+			name:    "glob_column_check",
+			current: `CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT CHECK (a GLOB '/x/*')) STRICT;`,
+		},
+		{
+			name:    "not_glob_table_check",
+			current: `CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, CHECK (a NOT GLOB '*.tmp')) STRICT;`,
+		},
+		{
+			name:    "match_default",
+			current: `CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT DEFAULT ('foo' MATCH 'bar')) STRICT;`,
+		},
+		{
+			name:    "is_generated",
+			current: `CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a IS 5) VIRTUAL) STRICT;`,
+		},
+		{
+			name:    "is_not_column_check",
+			current: `CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT CHECK (a IS NOT 'x')) STRICT;`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			desired := strings.Replace(c.current, ") STRICT;", ", extra TEXT) STRICT;", 1)
+			if desired == c.current {
+				t.Fatalf("test fixture bug: no ') STRICT;' to replace in %q", c.current)
+			}
+
+			ddls, err := New().Diff(desired, c.current)
+			if err != nil {
+				t.Fatalf("Diff: %v", err)
+			}
+			if len(ddls) != 1 || !strings.Contains(ddls[0], "ADD COLUMN extra") {
+				t.Fatalf("want a single ADD COLUMN extra statement, got %v", ddls)
+			}
+
+			db := openSeeded(t, c.current)
+			execAll(t, db, ddls)
+		})
+	}
+}
+
+// TestDiff_AddedColumnCarriesSQLiteOnlyExpression covers the added column
+// itself carrying a rejected expression: the placeholder minted for its
+// CHECK body must be restored byte-for-byte in the ADD COLUMN statement
+// sqldef emits, with no placeholder left in the output.
+func TestDiff_AddedColumnCarriesSQLiteOnlyExpression(t *testing.T) {
+	current := `CREATE TABLE t (id INTEGER PRIMARY KEY) STRICT;`
+	desired := `CREATE TABLE t (id INTEGER PRIMARY KEY, b TEXT CHECK (b GLOB '*.img')) STRICT;`
+
+	ddls, err := New().Diff(desired, current)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	want := `ALTER TABLE t ADD COLUMN b text CHECK (b GLOB '*.img')`
+	if len(ddls) != 1 || ddls[0] != want {
+		t.Fatalf("ddls = %v, want [%q]", ddls, want)
+	}
+	if strings.Contains(ddls[0], "sqlite_migrate_expr") {
+		t.Fatalf("expected no placeholder left in the output, got %q", ddls[0])
+	}
+
+	db := openSeeded(t, current)
+	execAll(t, db, ddls)
+}
+
+// TestDiff_AcceptedExpressionNotMasked is a direct check on exprMasker,
+// independent of what sqldef then does with it: an expression sqldef's
+// own parser already accepts (scenario 03's shape) passes through
+// mask unchanged, never replaced by a placeholder.
+func TestDiff_AcceptedExpressionNotMasked(t *testing.T) {
+	in := `CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 1)) STRICT;`
+	m := newExprMasker(in)
+	if got := m.mask(in); got != in {
+		t.Fatalf("mask(%q) = %q, want it unchanged", in, got)
+	}
+}
+
+// TestExprMasker_UnmaskErrorsOnUnresolvedPlaceholder covers the second
+// layer guarding a placeholder from ever reaching a migration file: if a
+// bare identifier shaped like this masker's placeholders shows up in
+// generated DDL without a matching minted body, unmask refuses it outright
+// instead of handing back a statement carrying it.
+func TestExprMasker_UnmaskErrorsOnUnresolvedPlaceholder(t *testing.T) {
+	m := newExprMasker("")
+	_, err := m.unmask([]string{fmt.Sprintf("ALTER TABLE t ADD COLUMN b TEXT CHECK (%s_99)", m.nonce)})
+	if err == nil {
+		t.Fatalf("want an error for an unresolved placeholder")
+	}
+	if !strings.Contains(err.Error(), "placeholder") {
+		t.Fatalf("want the error to name the placeholder, got: %v", err)
+	}
+}

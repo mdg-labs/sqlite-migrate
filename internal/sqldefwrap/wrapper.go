@@ -38,18 +38,30 @@ type sqldefDiffer struct{}
 // SQLite DDL diff — not sqldef.Run(), which drives a live DB connection and
 // is CLI-only. EnableDrop is left false: this wrapper's job is limited to
 // the additive cases sqldef gets right, so any DROP/REVOKE it would emit
-// for a case outside that job is commented out rather than executed.
+// for a case outside that job is commented out rather than executed. A
+// CREATE TABLE CHECK/DEFAULT/GENERATED expression body sqldef's own parser
+// can't parse (see exprMasker) is masked behind an opaque placeholder
+// before the call and restored in its output afterward, so a SQLite-only
+// operator there (GLOB, MATCH, IS <expr>, …) never reaches sqldef at all.
 func (sqldefDiffer) Diff(desiredDDL, currentDDL string) ([]string, error) {
+	masker := newExprMasker(desiredDDL, currentDDL)
+	maskedDesired := masker.mask(desiredDDL)
+	maskedCurrent := masker.mask(currentDDL)
+
 	ddls, err := schema.GenerateIdempotentDDLs(
 		schema.GeneratorModeSQLite3,
 		database.NewParser(parser.ParserModeSQLite3),
-		quoteCollidingKeywords(quoteExoticIdentifiers(desiredDDL)),
-		quoteCollidingKeywords(quoteExoticIdentifiers(currentDDL)),
+		quoteCollidingKeywords(quoteExoticIdentifiers(maskedDesired)),
+		quoteCollidingKeywords(quoteExoticIdentifiers(maskedCurrent)),
 		database.GeneratorConfig{},
 		"",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("sqldefwrap: generate DDLs: %w", err)
+	}
+	ddls, err = masker.unmask(ddls)
+	if err != nil {
+		return nil, err
 	}
 	return foldForeignKeysIntoAddColumn(ddls)
 }
