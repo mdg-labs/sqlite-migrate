@@ -315,6 +315,52 @@ func TestDiff_UniqueConstraintOnKeywordColumn(t *testing.T) {
 	execAll(t, db, ddls)
 }
 
+// TestDiff_IndexOnKeywordNamedTable covers a CREATE [UNIQUE] INDEX whose
+// index name or ON table is a colliding word: sqldef rejects both bare, so
+// an unrelated additive change on a schema carrying such an index used to
+// fail Diff with a syntax error.
+func TestDiff_IndexOnKeywordNamedTable(t *testing.T) {
+	cases := map[string]struct{ table, index string }{
+		"table name": {
+			table: `CREATE TABLE value (id INTEGER PRIMARY KEY, x TEXT%s) STRICT;`,
+			index: `CREATE INDEX value_x ON value (x);`,
+		},
+		"index name": {
+			table: `CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT%s) STRICT;`,
+			index: `CREATE INDEX serial ON t (x);`,
+		},
+		"unique if not exists": {
+			table: `CREATE TABLE key (id INTEGER PRIMARY KEY, date TEXT%s) STRICT;`,
+			index: `CREATE UNIQUE INDEX IF NOT EXISTS key_date ON key (date DESC);`,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			current := fmt.Sprintf(c.table, "") + "\n" + c.index
+			desired := fmt.Sprintf(c.table, ", extra TEXT") + "\n" + c.index
+
+			ddls, err := New().Diff(desired, current)
+			if err != nil {
+				t.Fatalf("Diff: %v", err)
+			}
+			if len(ddls) != 1 || !strings.Contains(ddls[0], "ADD COLUMN extra") {
+				t.Fatalf("want a single ADD COLUMN extra statement, got %v", ddls)
+			}
+
+			db := openSeeded(t, current)
+			execAll(t, db, ddls)
+		})
+	}
+}
+
+func TestQuoteCollidingKeywords_CreateIndex(t *testing.T) {
+	in := `CREATE UNIQUE INDEX IF NOT EXISTS serial ON value (key DESC, name) WHERE key IS NOT NULL;`
+	want := `CREATE UNIQUE INDEX IF NOT EXISTS "serial" ON "value" ("key" DESC, name) WHERE key IS NOT NULL;`
+	if got := quoteCollidingKeywords(in); got != want {
+		t.Fatalf("quoteCollidingKeywords(%q) = %q, want %q", in, got, want)
+	}
+}
+
 func TestDiff_ReferencesOnExistingColumn(t *testing.T) {
 	current := `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;
 CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER) STRICT;`

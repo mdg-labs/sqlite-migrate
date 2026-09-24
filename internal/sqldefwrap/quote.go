@@ -17,8 +17,9 @@ import (
 // text, date, … — SQLite itself accepts every one of these as an ordinary
 // identifier). Quoting only ever touches specific identifier positions —
 // the table name, a column-definition's own name, the column lists inside
-// PRIMARY KEY (…)/UNIQUE (…)/FOREIGN KEY (…), and a REFERENCES target
-// table/column list — found by walking the CREATE TABLE structure itself,
+// PRIMARY KEY (…)/UNIQUE (…)/FOREIGN KEY (…), a REFERENCES target
+// table/column list, and a CREATE [UNIQUE] INDEX's index name, table name
+// and column list — found by walking the statement structure itself,
 // never by scanning for a fixed word list. That keeps a column's own type
 // keyword ("name TEXT") or an inline "PRIMARY KEY" past this pass
 // untouched even though sqldef also rejects "text"/"key"/"primary" bare in
@@ -180,19 +181,30 @@ func (q *keywordQuoter) quoteIdentAt(i int) int {
 
 func (q *keywordQuoter) afterCreate(i int) int {
 	i = q.skipWS(i)
-	if !q.isIdent(i, "TABLE") {
-		return i
+	if q.isIdent(i, "UNIQUE") {
+		q.copy(i)
+		i++
+		i = q.skipWS(i)
+		if !q.isIdent(i, "INDEX") {
+			return i
+		}
 	}
-	q.copy(i)
-	i++
-	return q.createTable(i)
+	switch {
+	case q.isIdent(i, "TABLE"):
+		q.copy(i)
+		i++
+		return q.createTable(i)
+	case q.isIdent(i, "INDEX"):
+		q.copy(i)
+		i++
+		return q.createIndex(i)
+	}
+	return i
 }
 
-// createTable handles "[IF NOT EXISTS] <table-name> ( <column-list> )",
-// quoting the table name and delegating the column list to columnList.
-// Anything after the closing paren (STRICT, WITHOUT ROWID, the trailing
-// ';') is left for the caller's own token loop.
-func (q *keywordQuoter) createTable(i int) int {
+// ifNotExists copies an optional "IF NOT EXISTS" and returns the index of
+// the significant token after it.
+func (q *keywordQuoter) ifNotExists(i int) int {
 	i = q.skipWS(i)
 	if q.isIdent(i, "IF") {
 		q.copy(i)
@@ -209,13 +221,45 @@ func (q *keywordQuoter) createTable(i int) int {
 			i = q.skipWS(i)
 		}
 	}
+	return i
+}
 
+// createTable handles "[IF NOT EXISTS] <table-name> ( <column-list> )",
+// quoting the table name and delegating the column list to columnList.
+// Anything after the closing paren (STRICT, WITHOUT ROWID, the trailing
+// ';') is left for the caller's own token loop.
+func (q *keywordQuoter) createTable(i int) int {
+	i = q.ifNotExists(i)
 	i = q.quoteIdentAt(i)
 	i = q.skipWS(i)
 	if i < q.n && q.els[i].kind == "punct" && q.els[i].text == "(" {
 		q.copy(i)
 		i++
 		i = q.columnList(i)
+	}
+	return i
+}
+
+// createIndex handles "[IF NOT EXISTS] <index-name> ON <table-name>
+// ( <indexed-columns> )", quoting the index name, the table name and each
+// indexed column. A trailing partial-index WHERE clause is left for the
+// caller's own token loop, like anything after CREATE TABLE's column list.
+func (q *keywordQuoter) createIndex(i int) int {
+	i = q.ifNotExists(i)
+	i = q.quoteIdentAt(i)
+	i = q.skipWS(i)
+	if !q.isIdent(i, "ON") {
+		return i
+	}
+	q.copy(i)
+	i++
+	i = q.skipWS(i)
+	i = q.quoteIdentAt(i)
+	i = q.skipWS(i)
+	if i < q.n && q.els[i].kind == "punct" && q.els[i].text == "(" {
+		q.copy(i)
+		i++
+		i = q.identList(i)
 	}
 	return i
 }
