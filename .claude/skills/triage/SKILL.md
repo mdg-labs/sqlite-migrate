@@ -24,6 +24,8 @@ allowed-tools:
   - Bash(git grep *)
   - Bash(git clone *)
   - Bash(scripts/issue-status.sh *)
+metadata:
+  internal: true
 ---
 
 # triage
