@@ -244,6 +244,44 @@ CREATE INDEX idx_orders_user_id ON purchases(user_id);`
 	}
 }
 
+// TestGenerate_ColumnAddedToTableWithAppliedKeywordNamedColumn covers issue
+// #45's replay case: the unquoted "serial" column doesn't come from a
+// fresh schema.sql edit this run, but from a migration already written and
+// applied by an earlier generate — the shape schemadiff.Table.SQL (and so
+// sqldefwrap.Diff's currentDDL) always takes it in, replayed straight from
+// sqlite_master rather than re-parsed from schema.sql. A later, unrelated
+// additive change to that same table must still succeed.
+func TestGenerate_ColumnAddedToTableWithAppliedKeywordNamedColumn(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE disks (
+    id INTEGER PRIMARY KEY,
+    serial TEXT
+) STRICT;`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	writeSchema(t, schemaPath, `CREATE TABLE disks (
+    id INTEGER PRIMARY KEY,
+    serial TEXT,
+    capacity_gb INTEGER
+) STRICT;`)
+
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	if !strings.Contains(readFileString(t, res.path), "ADD COLUMN capacity_gb") {
+		t.Fatalf("expected a direct ADD COLUMN capacity_gb statement, got:\n%s", readFileString(t, res.path))
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
 func readFileString(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)

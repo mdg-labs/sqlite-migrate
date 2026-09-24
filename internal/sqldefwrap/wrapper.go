@@ -43,8 +43,8 @@ func (sqldefDiffer) Diff(desiredDDL, currentDDL string) ([]string, error) {
 	ddls, err := schema.GenerateIdempotentDDLs(
 		schema.GeneratorModeSQLite3,
 		database.NewParser(parser.ParserModeSQLite3),
-		quoteExoticIdentifiers(desiredDDL),
-		quoteExoticIdentifiers(currentDDL),
+		quoteCollidingKeywords(quoteExoticIdentifiers(desiredDDL)),
+		quoteCollidingKeywords(quoteExoticIdentifiers(currentDDL)),
 		database.GeneratorConfig{},
 		"",
 	)
