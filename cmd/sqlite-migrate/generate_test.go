@@ -100,12 +100,16 @@ func TestGenerate_SequentialSchemaChanges(t *testing.T) {
 		if configure != nil {
 			configure(&o)
 		}
-		res, err := generate(context.Background(), o, strings.NewReader(""), &bytes.Buffer{})
+		var stderr bytes.Buffer
+		res, err := generate(context.Background(), o, strings.NewReader(""), &bytes.Buffer{}, &stderr)
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
 		if !res.written {
 			t.Fatalf("expected a migration to be written")
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected no stderr note, got: %q", stderr.String())
 		}
 		assertJournalMatchesSchema(t, migrationsDir, schemaPath)
 		return res
@@ -203,14 +207,14 @@ CREATE TABLE purchases (
 
 CREATE INDEX idx_orders_user_id ON purchases(user_id);`
 	writeSchema(t, schemaPath, dropColSchema)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err == nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
 		t.Fatalf("expected refusal for a dropped column without --allow-destructive")
 	} else if !strings.Contains(err.Error(), "credits") {
 		t.Fatalf("expected the refusal to name the dropped column, got: %v", err)
 	}
 	dropColOpts := opts
 	dropColOpts.allowDestructive = true
-	dropColRes, err := generate(context.Background(), dropColOpts, strings.NewReader(""), &bytes.Buffer{})
+	dropColRes, err := generate(context.Background(), dropColOpts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate with --allow-destructive: %v", err)
 	}
@@ -223,14 +227,14 @@ CREATE INDEX idx_orders_user_id ON purchases(user_id);`
     full_name TEXT
 ) STRICT;`
 	writeSchema(t, schemaPath, dropTableSchema)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err == nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
 		t.Fatalf("expected refusal for a dropped table without --allow-destructive")
 	} else if !strings.Contains(err.Error(), "purchases") {
 		t.Fatalf("expected the refusal to name the dropped table, got: %v", err)
 	}
 	dropTableOpts := opts
 	dropTableOpts.allowDestructive = true
-	dropTableRes, err := generate(context.Background(), dropTableOpts, strings.NewReader(""), &bytes.Buffer{})
+	dropTableRes, err := generate(context.Background(), dropTableOpts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate with --allow-destructive: %v", err)
 	}
@@ -259,7 +263,7 @@ func TestGenerate_ColumnAddedToTableWithAppliedKeywordNamedColumn(t *testing.T) 
     id INTEGER PRIMARY KEY,
     serial TEXT
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
@@ -269,7 +273,7 @@ func TestGenerate_ColumnAddedToTableWithAppliedKeywordNamedColumn(t *testing.T) 
     capacity_gb INTEGER
 ) STRICT;`)
 
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -302,7 +306,7 @@ func TestGenerate_RenamePromptInteractive(t *testing.T) {
     id INTEGER PRIMARY KEY,
     name TEXT
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
@@ -312,7 +316,7 @@ func TestGenerate_RenamePromptInteractive(t *testing.T) {
 ) STRICT;`)
 
 	var out bytes.Buffer
-	res, err := generate(context.Background(), opts, strings.NewReader("y\n"), &out)
+	res, err := generate(context.Background(), opts, strings.NewReader("y\n"), &out, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -336,7 +340,7 @@ func TestGenerate_RenameDeclinedFallsBackToDestructive(t *testing.T) {
     id INTEGER PRIMARY KEY,
     name TEXT
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
@@ -346,7 +350,7 @@ func TestGenerate_RenameDeclinedFallsBackToDestructive(t *testing.T) {
 ) STRICT;`)
 
 	var out bytes.Buffer
-	_, err := generate(context.Background(), opts, strings.NewReader("n\n"), &out)
+	_, err := generate(context.Background(), opts, strings.NewReader("n\n"), &out, &bytes.Buffer{})
 	if err == nil {
 		t.Fatalf("expected refusal after declining the rename")
 	}
@@ -362,11 +366,11 @@ func TestGenerate_NoChanges(t *testing.T) {
 	opts := baseOptions(schemaPath, migrationsDir)
 
 	writeSchema(t, schemaPath, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate with no changes: %v", err)
 	}
@@ -379,7 +383,10 @@ func TestGenerate_NoChanges(t *testing.T) {
 // scenario (07-11, 16, 18) through the full generate pipeline: seed the
 // migrations directory with the scenario's "before" schema as if it were
 // already applied, point schema.sql at "after", and confirm generate
-// writes a migration that reproduces "after" exactly.
+// writes a migration that reproduces "after" exactly. None of these add a
+// column alongside their rebuild-worthy change, so needsRebuild's earlier
+// structural checks decide the rebuild directly and buildMigrationBody
+// must print no additiveChangeReproducesAfter stderr note for them.
 func TestGenerate_TestdataScenarios(t *testing.T) {
 	dirs, err := filepath.Glob("../../testdata/schemas/*")
 	if err != nil {
@@ -408,12 +415,16 @@ func TestGenerate_TestdataScenarios(t *testing.T) {
 			writeSchema(t, schemaPath, after)
 
 			opts := baseOptions(schemaPath, migrationsDir)
-			res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+			var stderr bytes.Buffer
+			res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &stderr)
 			if err != nil {
 				t.Fatalf("generate: %v", err)
 			}
 			if !res.written {
 				t.Fatalf("expected a migration to be written")
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("expected no stderr note for a structural rebuild, got: %q", stderr.String())
 			}
 			assertJournalMatchesSchema(t, migrationsDir, schemaPath)
 		})
@@ -438,7 +449,7 @@ func TestGenerate_CompoundTableAndColumnRename(t *testing.T) {
     id INTEGER PRIMARY KEY,
     qty INTEGER
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
@@ -449,7 +460,7 @@ func TestGenerate_CompoundTableAndColumnRename(t *testing.T) {
 
 	// Confirm the table rename (orders -> purchases), then the column
 	// rename it reveals (qty -> amount).
-	res, err := generate(context.Background(), opts, strings.NewReader("y\ny\n"), &bytes.Buffer{})
+	res, err := generate(context.Background(), opts, strings.NewReader("y\ny\n"), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -480,7 +491,7 @@ func TestGenerate_NewTableWithForeignKeyColumnAddedTogether(t *testing.T) {
 	writeSchema(t, schemaPath, `CREATE TABLE orders (
     id INTEGER PRIMARY KEY
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
@@ -493,7 +504,7 @@ CREATE TABLE regions (
     id INTEGER PRIMARY KEY
 ) STRICT;`)
 
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -508,7 +519,11 @@ CREATE TABLE regions (
 // that same table in the same schema.sql edit: needsRebuild used to
 // assume any added column fully explained the table's CREATE TABLE text
 // change, routing this straight to sqldefwrap (ADD COLUMN only) and
-// silently dropping the CHECK edit, which then failed the drift check.
+// silently dropping the CHECK edit, which then failed the drift check. It
+// also covers issue #52's stderr note: additiveChangeReproducesAfter
+// really does find a residual difference here (the tightened CHECK), so
+// the rebuild it falls back to must be announced on stderr, naming the
+// table.
 func TestGenerate_AddedColumnWithCheckConstraintChange(t *testing.T) {
 	_, schemaPath, migrationsDir := newProject(t)
 	opts := baseOptions(schemaPath, migrationsDir)
@@ -517,7 +532,7 @@ func TestGenerate_AddedColumnWithCheckConstraintChange(t *testing.T) {
     id INTEGER PRIMARY KEY,
     age INTEGER
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}
 
@@ -527,12 +542,124 @@ func TestGenerate_AddedColumnWithCheckConstraintChange(t *testing.T) {
     name TEXT
 ) STRICT;`)
 
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	var stderr bytes.Buffer
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &stderr)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	if !res.written {
 		t.Fatalf("expected a migration to be written")
+	}
+	if !strings.Contains(readFileString(t, res.path), "_sqlite_migrate_new") {
+		t.Fatalf("expected a full rebuild (the CHECK change isn't expressible as ADD COLUMN), got:\n%s", readFileString(t, res.path))
+	}
+	if !strings.Contains(stderr.String(), `generate: note: rebuilding "users" instead of ADD COLUMN:`) {
+		t.Fatalf("expected a stderr note naming the rebuilt table, got: %q", stderr.String())
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
+// TestGenerate_ColumnAddedToIndexedTableRebuiltByEarlierMigration covers
+// scenario 23's replayed-journal form: a table with an explicit CREATE
+// INDEX that was already rebuilt once (a tightened CHECK, applied in an
+// earlier migration), then gets a further nullable column added. The
+// index fix in additiveChangeReproducesAfter must still recognize this as
+// a plain additive change, not fall back to a second rebuild just because
+// the table carries an index.
+func TestGenerate_ColumnAddedToIndexedTableRebuiltByEarlierMigration(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL
+) STRICT;
+CREATE INDEX widgets_status_idx ON widgets (status);`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	// Tighten the CHECK: not expressible as ALTER TABLE, so this is a
+	// genuine rebuild — the journal now holds a rebuilt CREATE TABLE for
+	// widgets alongside its still-untouched explicit index.
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('open', 'closed'))
+) STRICT;
+CREATE INDEX widgets_status_idx ON widgets (status);`)
+	rebuiltRes, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("generate (rebuild): %v", err)
+	}
+	if !strings.Contains(readFileString(t, rebuiltRes.path), "_sqlite_migrate_new") {
+		t.Fatalf("expected the CHECK tightening to produce a rebuild, got:\n%s", readFileString(t, rebuiltRes.path))
+	}
+
+	// Now add a plain nullable column on top of the rebuilt, indexed table.
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
+    notes TEXT
+) STRICT;
+CREATE INDEX widgets_status_idx ON widgets (status);`)
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	body := readFileString(t, res.path)
+	if !strings.Contains(body, "ADD COLUMN notes") {
+		t.Fatalf("expected a direct ADD COLUMN notes statement, got:\n%s", body)
+	}
+	if strings.Contains(body, "_sqlite_migrate_new") {
+		t.Fatalf("expected a plain ADD COLUMN, not a rebuild, got:\n%s", body)
+	}
+	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
+}
+
+// TestGenerate_ColumnAddedToIndexedTableWithCheckChangeStillRebuilds
+// covers scenario 08's shape (a tightened CHECK) plus an explicit index
+// plus a new column, all in the same schema.sql edit: the index fix must
+// not turn this genuine rebuild into an incorrect ADD COLUMN.
+func TestGenerate_ColumnAddedToIndexedTableWithCheckChangeStillRebuilds(t *testing.T) {
+	_, schemaPath, migrationsDir := newProject(t)
+	opts := baseOptions(schemaPath, migrationsDir)
+
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT
+) STRICT;
+CREATE INDEX widgets_status_idx ON widgets (status);`)
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+
+	writeSchema(t, schemaPath, `CREATE TABLE widgets (
+    id INTEGER PRIMARY KEY,
+    status TEXT CHECK (status IN ('open', 'closed')),
+    notes TEXT
+) STRICT;
+CREATE INDEX widgets_status_idx ON widgets (status);`)
+
+	var stderr bytes.Buffer
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !res.written {
+		t.Fatalf("expected a migration to be written")
+	}
+	body := readFileString(t, res.path)
+	if !strings.Contains(body, "_sqlite_migrate_new") {
+		t.Fatalf("expected a full rebuild (the CHECK change isn't expressible as ADD COLUMN), got:\n%s", body)
+	}
+	if strings.Contains(body, "ADD COLUMN notes") {
+		t.Fatalf("expected no direct ADD COLUMN, got:\n%s", body)
+	}
+	if !strings.Contains(stderr.String(), `generate: note: rebuilding "widgets" instead of ADD COLUMN:`) {
+		t.Fatalf("expected a stderr note naming the rebuilt table, got: %q", stderr.String())
 	}
 	assertJournalMatchesSchema(t, migrationsDir, schemaPath)
 }
@@ -550,7 +677,7 @@ func TestGenerate_ConflictingAssumeRenameFlags(t *testing.T) {
 
 	writeSchema(t, schemaPath, `CREATE TABLE users (id INTEGER PRIMARY KEY) STRICT;`)
 
-	_, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	_, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if !errors.Is(err, rename.ErrConflictingAssumeFlags) {
 		t.Fatalf("expected ErrConflictingAssumeFlags, got: %v", err)
 	}
@@ -632,7 +759,7 @@ func TestGolden(t *testing.T) {
 			}
 
 			goldenPath := filepath.Join("..", "..", "testdata", "golden", "generate", name+".sql")
-			res, genErr := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+			res, genErr := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 
 			if goldenRefused[name] {
 				if genErr == nil {
