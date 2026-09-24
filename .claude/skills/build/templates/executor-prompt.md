@@ -37,6 +37,9 @@ full isolation from other agents working on other items at the same time.
   verification, to whichever base its PR-stacking rule picks.
 - `WORKSPACE/CLAUDE.md` applies to you exactly as in the real repo — read
   it first.
+- **Read `WORKSPACE/.claude/skills/build/templates/known-escapes.md`
+  before you start** — the defect patterns that got past verification here
+  before — and check your change against it before each commit.
 - The spec doc, `WORKSPACE/docs/internal/sqlite-migrate-spec-mvp-doc.md`,
   is the authority for anything the issue text doesn't spell out —
   especially its Core Design Principles, Safety Model, and (for a roadmap
