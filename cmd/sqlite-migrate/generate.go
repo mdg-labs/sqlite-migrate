@@ -65,7 +65,7 @@ func RunGenerate(args []string, stdin io.Reader, stdout, stderr io.Writer, now f
 		return 2
 	}
 
-	result, err := generate(context.Background(), opts, stdin, stdout)
+	result, err := generate(context.Background(), opts, stdin, stdout, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "generate: %v\n", err)
 		return 1
@@ -85,8 +85,10 @@ type generateResult struct {
 
 // generate runs the full generate pipeline described at the top of this
 // file and returns whether a migration file was written and, if so, its
-// path. An error means generate refused to write anything.
-func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout io.Writer) (generateResult, error) {
+// path. An error means generate refused to write anything. Diagnostic
+// notes about routing decisions (see buildMigrationBody) go to stderr, not
+// into the returned result or the migration file itself.
+func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout, stderr io.Writer) (generateResult, error) {
 	if opts.assumeRenames && opts.assumeNoRenames {
 		return generateResult{}, rename.ErrConflictingAssumeFlags
 	}
@@ -192,9 +194,12 @@ func generate(ctx context.Context, opts generateOptions, stdin io.Reader, stdout
 		return generateResult{}, destructiveError(classification)
 	}
 
-	body, err := buildMigrationBody(ctx, renameSection, diff, currentSchemaResolved, desiredSchema, currentDDLResolved, desiredDDL)
+	body, notes, err := buildMigrationBody(ctx, renameSection, diff, currentSchemaResolved, desiredSchema, currentDDLResolved, desiredDDL)
 	if err != nil {
 		return generateResult{}, err
+	}
+	for _, note := range notes {
+		_, _ = fmt.Fprintf(stderr, "generate: note: %s\n", note)
 	}
 
 	if err := verifyCandidate(ctx, journalDDL, body, desiredSchema); err != nil {
@@ -287,25 +292,32 @@ func destructiveError(c schemadiff.Classification) error {
 // express, internal/sqldefwrap for the additive column changes it already
 // gets right, and this package directly for the cases neither needs
 // (new/removed tables, explicit index changes, table/column drops) — and
-// assembles the result in a fixed, deterministic order.
-func buildMigrationBody(ctx context.Context, renameSection string, diff *schemadiff.SchemaDiff, current, desired *schemadiff.Schema, currentDDL, desiredDDL string) (string, error) {
+// assembles the result in a fixed, deterministic order. The returned notes
+// are diagnostics for stderr, one per table rebuilt because
+// additiveChangeReproducesAfter found a residual difference; they carry no
+// weight in the generated SQL itself.
+func buildMigrationBody(ctx context.Context, renameSection string, diff *schemadiff.SchemaDiff, current, desired *schemadiff.Schema, currentDDL, desiredDDL string) (string, []string, error) {
 	var sqldefStmts []string
 	var directStmts []string
 	var rebuildDiffs []schemadiff.TableDiff
+	var notes []string
 
 	for _, td := range diff.ChangedTables {
-		full, err := needsRebuild(ctx, td)
+		decision, err := needsRebuild(ctx, td)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
-		if full {
+		if decision.Full {
 			rebuildDiffs = append(rebuildDiffs, td)
+			if decision.Reason != "" {
+				notes = append(notes, fmt.Sprintf("rebuilding %q instead of ADD COLUMN: %s", td.Name, decision.Reason))
+			}
 			continue
 		}
 		if len(td.AddedColumns) > 0 {
 			stmts, err := addColumnStatements(td, current, desired)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			sqldefStmts = append(sqldefStmts, stmts...)
 		}
@@ -337,7 +349,7 @@ func buildMigrationBody(ctx context.Context, renameSection string, diff *schemad
 	if len(rebuildDiffs) > 0 {
 		sql, err := rebuild.Generate(ctx, currentDDL, desiredDDL, rebuildDiffs)
 		if err != nil {
-			return "", fmt.Errorf("rebuild: %w", err)
+			return "", nil, fmt.Errorf("rebuild: %w", err)
 		}
 		rebuildSQL = strings.TrimSuffix(sql, "\n")
 	}
@@ -354,7 +366,17 @@ func buildMigrationBody(ctx context.Context, renameSection string, diff *schemad
 			nonEmpty = append(nonEmpty, s)
 		}
 	}
-	return strings.Join(nonEmpty, "\n\n") + "\n", nil
+	return strings.Join(nonEmpty, "\n\n") + "\n", notes, nil
+}
+
+// rebuildDecision is needsRebuild's verdict for one changed table. Reason
+// is set only when Full is true because additiveChangeReproducesAfter
+// found a residual difference — every other rebuild trigger is a plain
+// structural fact (a removed column, an implied index change, …) that
+// needs no explanation.
+type rebuildDecision struct {
+	Full   bool
+	Reason string
 }
 
 // needsRebuild decides whether a changed table requires the full 12-step
@@ -366,71 +388,108 @@ func buildMigrationBody(ctx context.Context, renameSection string, diff *schemad
 // fully explained by the added columns themselves (a CHECK/COLLATE/
 // GENERATED change PRAGMA introspection can't see any other way — see
 // schemadiff.TableDiff.SQLChanged and additiveChangeReproducesAfter).
-func needsRebuild(ctx context.Context, td schemadiff.TableDiff) (bool, error) {
+func needsRebuild(ctx context.Context, td schemadiff.TableDiff) (rebuildDecision, error) {
 	if len(td.RemovedColumns) > 0 || len(td.ChangedColumns) > 0 || len(td.RemovedForeignKeys) > 0 {
-		return true, nil
+		return rebuildDecision{Full: true}, nil
 	}
 	for _, fk := range td.AddedForeignKeys {
 		if !isAddedColumn(td, fk.From) {
-			return true, nil
+			return rebuildDecision{Full: true}, nil
 		}
 	}
 	for _, idx := range td.AddedIndexes {
 		if idx.Origin != "c" {
-			return true, nil
+			return rebuildDecision{Full: true}, nil
 		}
 	}
 	for _, idx := range td.RemovedIndexes {
 		if idx.Origin != "c" {
-			return true, nil
+			return rebuildDecision{Full: true}, nil
 		}
 	}
 	if !td.SQLChanged {
-		return false, nil
+		return rebuildDecision{}, nil
 	}
 	if len(td.AddedColumns) == 0 {
-		return true, nil
+		return rebuildDecision{Full: true}, nil
 	}
-	ok, err := additiveChangeReproducesAfter(ctx, td)
+	ok, reason, err := additiveChangeReproducesAfter(ctx, td)
 	if err != nil {
-		return false, err
+		return rebuildDecision{}, err
 	}
-	return !ok, nil
+	if ok {
+		return rebuildDecision{}, nil
+	}
+	return rebuildDecision{Full: true, Reason: reason}, nil
 }
 
 // additiveChangeReproducesAfter reports whether generating and applying
-// sqldef's additive statements for td's own before/after CREATE TABLE text
-// alone reproduces the desired table exactly. This is the only reliable
-// way to tell a table whose CREATE TABLE text changed purely because of
-// its added columns apart from one that picked up an untracked
-// CHECK/COLLATE/GENERATED change in the same schema.sql edit: neither case
-// is distinguishable from schemadiff.TableDiff's structured fields alone
-// (see SQLChanged), so this replays the candidate additive-only change
-// into a scratch database and compares the result structurally, the same
-// technique verifyCandidate uses for the whole migration.
-func additiveChangeReproducesAfter(ctx context.Context, td schemadiff.TableDiff) (bool, error) {
+// sqldef's additive statements for td's own before/after CREATE TABLE text,
+// followed by td.After's own explicit indexes so both sides of the
+// comparison carry the same index set (buildMigrationBody emits the
+// explicit index changes separately, and a target index may reference an
+// added column, so they replay after the ADD statements), reproduces the
+// desired table exactly. This is the only reliable way to tell a table whose CREATE
+// TABLE text changed purely because of its added columns apart from one
+// that picked up an untracked CHECK/COLLATE/GENERATED change in the same
+// schema.sql edit: neither case is distinguishable from
+// schemadiff.TableDiff's structured fields alone (see SQLChanged), so this
+// replays the candidate additive-only change into a scratch database and
+// compares the result structurally, the same technique verifyCandidate
+// uses for the whole migration. When it returns false, reason explains why
+// for the stderr note buildMigrationBody attaches to the resulting
+// rebuild.
+//
+// The scratch replay's table is empty, and SQLite only rejects an ADD
+// COLUMN with a non-constant DEFAULT (CURRENT_TIMESTAMP, a function call,
+// GLOB/MATCH, …) when the table has rows, so each added column's DEFAULT
+// is first probed against a one-row table: one the real database would
+// reject there routes the table to a rebuild instead.
+func additiveChangeReproducesAfter(ctx context.Context, td schemadiff.TableDiff) (ok bool, reason string, err error) {
+	for _, c := range td.AddedColumns {
+		if !c.HasDefault {
+			continue
+		}
+		probe := fmt.Sprintf("CREATE TABLE _sqlite_migrate_probe_ (x INTEGER) STRICT;\n"+
+			"INSERT INTO _sqlite_migrate_probe_ VALUES (1);\n"+
+			"ALTER TABLE _sqlite_migrate_probe_ ADD COLUMN c ANY DEFAULT (%s);", c.DefaultValue)
+		if _, err := schemadiff.Parse(ctx, probe); err != nil {
+			return false, fmt.Sprintf("added column %q has a DEFAULT that ALTER TABLE ADD COLUMN rejects on a non-empty table", c.Name), nil
+		}
+	}
+
 	ddls, err := sqldefwrap.New().Diff(td.After.SQL, td.Before.SQL)
 	if err != nil {
-		return false, fmt.Errorf("sqldefwrap: %w", err)
+		return false, "", fmt.Errorf("sqldefwrap: %w", err)
 	}
 	stmts := make([]string, len(ddls))
 	for i, ddl := range ddls {
 		stmts[i] = ddl + ";"
 	}
 
-	beforeSQL := strings.TrimRight(td.Before.SQL, "; \t\n") + ";"
-	replayed, err := schemadiff.Parse(ctx, beforeSQL+"\n"+strings.Join(stmts, "\n"))
+	parts := []string{strings.TrimRight(td.Before.SQL, "; \t\n") + ";"}
+	parts = append(parts, stmts...)
+	for _, idx := range td.After.Indexes {
+		if idx.Origin == "c" && idx.SQL != "" {
+			parts = append(parts, strings.TrimRight(idx.SQL, "; \t\n")+";")
+		}
+	}
+
+	replayed, err := schemadiff.Parse(ctx, strings.Join(parts, "\n"))
 	if err != nil {
-		return false, nil
+		return false, fmt.Sprintf("replaying the added columns failed: %v", err), nil
 	}
 	got, ok := replayed.Tables[td.Name]
 	if !ok {
-		return false, nil
+		return false, "table not found after replaying the added columns", nil
 	}
 
 	gotSchema := &schemadiff.Schema{Tables: map[string]*schemadiff.Table{td.Name: got}}
 	wantSchema := &schemadiff.Schema{Tables: map[string]*schemadiff.Table{td.Name: td.After}}
-	return schemadiff.Diff(gotSchema, wantSchema).Empty(), nil
+	if schemadiff.Diff(gotSchema, wantSchema).Empty() {
+		return true, "", nil
+	}
+	return false, "CREATE TABLE text differs beyond the added columns", nil
 }
 
 func isAddedColumn(td schemadiff.TableDiff, name string) bool {

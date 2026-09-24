@@ -27,7 +27,7 @@ func TestCLI_MultiMigrationUpgradeSequence(t *testing.T) {
 	generateStep := func(sql string) {
 		t.Helper()
 		writeSchema(t, schemaPath, sql)
-		res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+		res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
@@ -167,7 +167,7 @@ func TestCLI_Apply_DetectsChecksumTamper(t *testing.T) {
 	writeSchema(t, schemaPath, `CREATE TABLE users (
     id INTEGER PRIMARY KEY
 ) STRICT;`)
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil || !res.written {
 		t.Fatalf("generate: res=%+v err=%v", res, err)
 	}
@@ -200,7 +200,7 @@ func TestCLI_Check_DetectsFileTamper(t *testing.T) {
 	writeSchema(t, schemaPath, `CREATE TABLE users (
     id INTEGER PRIMARY KEY
 ) STRICT;`)
-	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{})
+	res, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil || !res.written {
 		t.Fatalf("generate: res=%+v err=%v", res, err)
 	}
@@ -234,7 +234,7 @@ func TestCLI_Status_ColdDatabase(t *testing.T) {
 	writeSchema(t, schemaPath, `CREATE TABLE users (
     id INTEGER PRIMARY KEY
 ) STRICT;`)
-	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+	if _, err := generate(context.Background(), opts, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 
